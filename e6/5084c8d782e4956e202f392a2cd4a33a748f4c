@@ -1,0 +1,22 @@
+dsh-plugin/src/index.js
+  h_afc6b161d429e0 11,33-37,45-47
+service/server/workbench.py
+  h_afc6b161d429e0 176-200,230
+skill/html-workbench/scripts/workbench.py
+  h_afc6b161d429e0 176-200,230
+tests/host_diagnostics.test.mjs
+  h_afc6b161d429e0 331-351
+tests/test_workbench.py
+  h_afc6b161d429e0 627-678
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e65084c8d782e4956e202f392a2cd4a33a748f4c",
+  "prompts": {},
+  "humans": {
+    "h_afc6b161d429e0": {
+      "author": "周鸿轩 <zhouhongxuan@BakMacBook-Pro.local>"
+    }
+  }
+}
