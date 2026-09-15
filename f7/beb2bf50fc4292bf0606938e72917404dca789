@@ -1,0 +1,16 @@
+dsh-plugin/README.md
+  h_afc6b161d429e0 50-53
+dsh-plugin/src/client.js
+  h_afc6b161d429e0 723
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7beb2bf50fc4292bf0606938e72917404dca789",
+  "prompts": {},
+  "humans": {
+    "h_afc6b161d429e0": {
+      "author": "周鸿轩 <zhouhongxuan@BakMacBook-Pro.local>"
+    }
+  }
+}
