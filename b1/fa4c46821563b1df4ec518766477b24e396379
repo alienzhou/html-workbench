@@ -1,0 +1,18 @@
+service/server/workbench.py
+  h_afc6b161d429e0 258-261,272-282,1677-1683,1685,1695-1710,1772-1773
+skill/html-workbench/scripts/workbench.py
+  h_afc6b161d429e0 258-261,272-282,1677-1683,1685,1695-1710,1772-1773
+tests/test_workbench.py
+  h_afc6b161d429e0 490-543
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b1fa4c46821563b1df4ec518766477b24e396379",
+  "prompts": {},
+  "humans": {
+    "h_afc6b161d429e0": {
+      "author": "周鸿轩 <zhouhongxuan@BakMacBook-Pro.local>"
+    }
+  }
+}
