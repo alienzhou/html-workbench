@@ -115,6 +115,7 @@ python3 skill/html-workbench/scripts/workbench.py serve
 源码保留在 `service/`、`build/` 和 `tests/`；可分发 Skill 始终维护在 `skill/html-workbench/`，DeepSeek Harness 插件在 `dsh-plugin/`。
 
 ```bash
+npm install
 npm run build
 npm test
 ```

@@ -9,5 +9,11 @@
     "check:skill": "npm run build && git diff --exit-code -- skill/html-workbench",
     "serve": "python3 skill/html-workbench/scripts/workbench.py serve",
     "test": "npm run build && python3 -m unittest discover -s tests -v && node --test 'tests/**/*.test.mjs'"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/cordis-plugin-timer": "1.1.6",
+    "react": "18.2.0",
+    "react-test-renderer": "18.2.0"
   }
 }

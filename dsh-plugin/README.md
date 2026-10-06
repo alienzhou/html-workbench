@@ -4,6 +4,18 @@
 
 > 只托管源码，不做编译/打包。插件通过 `shell` 服务拉起仓库里**已生成**的 runnable workbench（`skill/html-workbench/scripts/workbench.py`，由根目录 `npm run build` 从 `service/` 生成）。
 
+## 面板席位
+
+面板优先使用 profile 提供的侧栏，入口在右侧栏的「新标签页」列表：
+
+- **有 DSH 原生右侧栏**：直接注册 `html-workbench` 标签，并使用 `keepMounted: true`，切换标签、会话或收起侧栏时保留编辑器与未保存的内容。每个标签的文件路径、加载状态和编辑器相互独立。
+- **只有 `dsh-better-sidebar` 服务**：通过它的注册表提供侧栏页面，兼容旧 profile。
+- **两种侧栏服务都没有**：保留浮窗和右上角入口，左边缘可拖拽调宽。
+
+两种侧栏席位都由宿主管理宽度、边框和关闭，工作台不再往 `#root` 写右边距。服务通过 `ctx.inject` 动态检测，加载顺序不影响选择；原生侧栏优先，避免重复入口，服务移除时自动回退。
+
+已实测 DSH `0.2.0-rc.2` + `dsh-better-sidebar` `0.24.1`。后者的原生适配层尚未传递 `keepMounted`，所以在当前 DSH 上直接使用官方注册表，以免切换标签时卸载编辑器。旧 profile 的保留行为仍取决于其侧栏宿主。
+
 ## 目录结构
 
 ```

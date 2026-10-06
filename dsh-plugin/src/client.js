@@ -7,13 +7,17 @@
  * `window.__ModuleLoader__.load(...)` at build time.
  *
  * Responsibilities (runs in the browser):
- *  - Register a right-side panel + corner trigger in `shell.overlay`.
+ *  - Register a retained tab in DSH's native right sidebar when available,
+ *    fall back to dsh-better-sidebar's registry on older profiles, then to a
+ *    floating panel plus corner trigger in `shell.overlay`. The sidebar owns
+ *    its column; the workbench must not reserve a second panel's width.
  *  - Layout is browser-like: a two-row chrome at the TOP (identity row +
  *    address/toolbar row) and the preview filling everything below. Nothing
  *    sits at the bottom, so the panel never visually competes with the chat
  *    composer on the left.
  *  - Open a file by calling Host `open`, then embed the workbench URL in an
- *    iframe. Left edge is draggable to resize the panel width (persisted).
+ *    iframe. The floating panel's left edge is draggable to resize its width
+ *    (persisted); the tabbed panel follows the column's own width.
  *
  * Styling contract: every colour/shadow comes from the host's `--dsw-alias-*`
  * design tokens (see the DSH first-party plugins) so light/dark themes and
@@ -25,7 +29,6 @@ return {
   inject: ['timer'],
   apply(ctx) {
     const slots = ctx.get('slots')
-    if (slots === undefined) return
 
     // ── Styles ───────────────────────────────────────────────────────────────
     // NOTE: both style shims (dynamic runner + static bundle) de-duplicate by a
@@ -35,23 +38,11 @@ return {
     // positioned chevron collapsing into a block below the input). So manage the
     // <style> element here: drop every previous generation, then insert fresh.
     const STYLE_MARK = 'data-hwb-styles'
-    const STYLE_VERSION = '5'
+    const STYLE_VERSION = '6'
 
+    // Chrome both seats share.
     const CSS = `
-html #root {
-  margin-right: calc(var(--dsh-sidebar-width, 0px) + var(--hwb-panel-width, 0px));
-  transition: margin-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
-}
-body[data-hwb-dragging] #root { transition: none; }
 body[data-hwb-dragging] { user-select: none; cursor: col-resize; }
-
-/* Reserve right-side clearance in the session header so the corner trigger
-   never overlaps its right-aligned utilities (e.g. "Session log"). The
-   clearance relaxes as the panel opens, because the trigger then hides. */
-header:has([data-slot="conversation.session.header.utilities"]) {
-  padding-right: max(28px, calc(60px - var(--hwb-panel-width, 0px)));
-  transition: padding-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
-}
 
 .hwb-panel, .hwb-panel * { box-sizing: border-box; }
 .hwb-panel {
@@ -67,11 +58,13 @@ header:has([data-slot="conversation.session.header.utilities"]) {
   --hwb-mono: var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
 
-/* Resize handle — a wide invisible hit area with a thin visible rail. */
-.hwb-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 9px; z-index: 5; cursor: col-resize; touch-action: none; border: none; padding: 0; background: transparent; }
-.hwb-resize::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; border-radius: 2px; background: transparent; transition: background 150ms ease; }
-.hwb-resize:hover::after, .hwb-resize:focus-visible::after, .hwb-resize[data-active]::after { background: var(--dsw-alias-interactive-bg-hover-accent); }
-.hwb-resize:focus-visible { outline: none; }
+/* Sidebar seat: the tab body already is a full-height flex column, so the
+   panel drops the floating seat's geometry — no fixed seat, no width of its
+   own, no seam against the chat column — and fills what it was handed. */
+.hwb-panel[data-seat="sidebar"] {
+  position: static; inset: auto; flex: 1 1 auto; height: 100%; min-height: 0;
+  border-left: none; box-shadow: none; z-index: auto;
+}
 
 /* ── Chrome: identity row + toolbar row ───────────────────────────────────── */
 .hwb-chrome { flex: none; display: flex; flex-direction: column; background: var(--dsw-alias-bg-layer-1); border-bottom: 1px solid var(--dsw-alias-border-l2); }
@@ -209,7 +202,42 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 .hwb-recent-label { padding: 0 8px 2px; color: var(--dsw-alias-label-tertiary); font-size: 11px; }
 .hwb-spinner { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--dsw-alias-border-l1); border-top-color: var(--dsw-alias-state-business-primary, #4d6bfe); animation: hwb-spin 700ms linear infinite; }
 
-/* ── Corner trigger ───────────────────────────────────────────────────────── */
+@keyframes hwb-spin { to { transform: rotate(360deg); } }
+@keyframes hwb-pop { from { opacity: 0; transform: translateY(-4px); } }
+@media (prefers-reduced-motion: reduce) {
+  .hwb-menu { animation: none; }
+}
+`
+
+    // Everything the floating seat owns and the sidebar seat must not have: the
+    // width a floating panel takes out of `#root`, the room its corner trigger
+    // needs in the session header, and the chrome those two elements wear. Under
+    // the sidebar seat the column's width, the trigger's job and the frame around
+    // the panel all belong to that plugin, so this sheet stays out of the
+    // document entirely.
+    const OVERLAY_CSS = `
+html #root {
+  margin-right: calc(var(--dsh-sidebar-width, 0px) + var(--hwb-panel-width, 0px));
+  transition: margin-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
+}
+body[data-hwb-dragging] #root { transition: none; }
+
+/* Reserve right-side clearance in the session header so the corner trigger
+   never overlaps its right-aligned utilities (e.g. "Session log"). The
+   clearance relaxes as the panel opens, because the trigger then hides. */
+header:has([data-slot="conversation.session.header.utilities"]) {
+  padding-right: max(28px, calc(60px - var(--hwb-panel-width, 0px)));
+  transition: padding-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
+}
+
+/* Resize handle — a wide invisible hit area with a thin visible rail. */
+.hwb-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 9px; z-index: 5; cursor: col-resize; touch-action: none; border: none; padding: 0; background: transparent; }
+.hwb-resize::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; border-radius: 2px; background: transparent; transition: background 150ms ease; }
+.hwb-resize:hover::after, .hwb-resize:focus-visible::after, .hwb-resize[data-active]::after { background: var(--dsw-alias-interactive-bg-hover-accent); }
+.hwb-resize:focus-visible { outline: none; }
+
+/* Corner trigger — the floating seat's entry point, sitting just clear of the
+   panel's left edge (and of the session header's own utilities). */
 .hwb-trigger {
   position: fixed; top: 8px;
   right: calc(var(--dsh-sidebar-width, 0px) + var(--hwb-panel-width, 0px) + 12px);
@@ -221,30 +249,10 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 .hwb-trigger:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
 .hwb-trigger:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #4d6bfe); outline-offset: 1px; }
 
-@keyframes hwb-spin { to { transform: rotate(360deg); } }
-@keyframes hwb-pop { from { opacity: 0; transform: translateY(-4px); } }
 @media (prefers-reduced-motion: reduce) {
-  html #root, .hwb-trigger, header:has([data-slot="conversation.session.header.utilities"]) { transition: none; }
-  .hwb-menu { animation: none; }
+  html #root, header:has([data-slot="conversation.session.header.utilities"]), .hwb-trigger { transition: none; }
 }
 `
-
-    const applyStyles = () => {
-      if (typeof document === 'undefined') { try { styles.insert(CSS) } catch (e) {} return () => {} }
-      const stale = document.querySelectorAll('style[' + STYLE_MARK + '], style#html-workbench-dsh-plugin-styles')
-      for (let i = 0; i < stale.length; i += 1) {
-        const node = stale[i]
-        if (node.parentNode) node.parentNode.removeChild(node)
-      }
-      const el = document.createElement('style')
-      el.setAttribute(STYLE_MARK, STYLE_VERSION)
-      el.textContent = CSS
-      document.head.appendChild(el)
-      return () => { if (el.parentNode) el.parentNode.removeChild(el) }
-    }
-
-    if (typeof ctx.effect === 'function') ctx.effect(applyStyles, 'html-workbench: styles')
-    else applyStyles()
 
     // ── Store ────────────────────────────────────────────────────────────────
     const DEFAULT_WIDTH = 820
@@ -260,9 +268,11 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     }
     const writeWidth = (w) => { try { window.localStorage.setItem(WIDTH_KEY, String(w)) } catch (e) {} }
 
-    let resolveTimer = null
-
-    const store = {
+    const createStore = () => ({
+      // Which seat the panel is in: the plugin's own floating overlay, or the
+      // tab dsh-better-sidebar hosts. Both seats and the stylesheet read this,
+      // and `setSeat` is the only writer.
+      seat: 'overlay',
       open: false,
       panelWidth: readWidth(),
       assets: [],
@@ -278,6 +288,8 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       diag: null,
       diagOpen: false,
       restarting: false,
+      resolveTimer: null,
+      resolveSequence: 0,
       listeners: [],
       subscribe(fn) { this.listeners.push(fn); return () => { this.listeners = this.listeners.filter((f) => f !== fn) } },
       set(patch) {
@@ -292,12 +304,58 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         }
         if (dirty) this.listeners.forEach((fn) => { try { fn() } catch (e) {} })
       },
+    })
+
+    // The overlay has one global instance. Sidebar tabs own their editing
+    // state so opening a file in one session cannot remount another's iframe.
+    const store = createStore()
+
+    const useStore = (target = store) => {
+      const [, force] = React.useState(0)
+      React.useEffect(() => target.subscribe(() => force((x) => x + 1)), [target])
+      return target
     }
 
-    const useStore = () => {
-      const [, force] = React.useState(0)
-      React.useEffect(() => store.subscribe(() => force((x) => x + 1)), [])
-      return store
+    // Only the floating seat reserves width in `#root` and needs the session
+    // header to keep clear of its corner trigger, so the sheet swaps with the
+    // seat instead of carrying rules the sidebar seat would have to fight.
+    let styleEl = null
+    let disposed = false
+    const applyStyles = () => {
+      if (disposed) return
+      const sheet = store.seat === 'overlay' ? CSS + OVERLAY_CSS : CSS
+      if (typeof document === 'undefined') { try { styles.insert(sheet) } catch (e) {} return }
+      const stale = document.querySelectorAll('style[' + STYLE_MARK + '], style#html-workbench-dsh-plugin-styles')
+      for (let i = 0; i < stale.length; i += 1) {
+        const node = stale[i]
+        if (node.parentNode) node.parentNode.removeChild(node)
+      }
+      styleEl = document.createElement('style')
+      styleEl.setAttribute(STYLE_MARK, STYLE_VERSION)
+      styleEl.textContent = sheet
+      document.head.appendChild(styleEl)
+    }
+
+    const setSeat = (next) => {
+      if (disposed) return
+      if (store.seat === next) return
+      store.set({ seat: next })
+      applyStyles()
+    }
+
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => {
+        applyStyles()
+        return () => {
+          // A nested injection can finish disposing after this effect. Its
+          // fallback must not reinstall styles once the plugin has unloaded.
+          disposed = true
+          if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl)
+          styleEl = null
+        }
+      }, 'html-workbench: styles')
+    } else {
+      applyStyles()
     }
 
     const basename = (p) => {
@@ -342,66 +400,66 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         && a.processStatus === b.processStatus && a.exitCode === b.exitCode
     }
 
-    const refresh = (explicit) => {
-      if (explicit) store.set({ refreshing: true })
+    const refresh = (explicit, target = store) => {
+      if (explicit) target.set({ refreshing: true })
       return host.call('list').then((res) => {
         if (res && res.ok) {
           const next = res.assets || []
-          store.set({
-            assets: sameAssets(store.assets, next) ? store.assets : next,
+          target.set({
+            assets: sameAssets(target.assets, next) ? target.assets : next,
             running: !!res.running,
-            diag: sameDiag(store.diag, res) ? store.diag : res,
+            diag: sameDiag(target.diag, res) ? target.diag : res,
           })
         } else {
-          store.set({ error: (res && res.error) || 'list failed' })
+          target.set({ error: (res && res.error) || 'list failed' })
         }
-      }).catch((e) => store.set({ error: String(e && e.message ? e.message : e) }))
-        .then(() => { if (explicit) store.set({ refreshing: false }) })
+      }).catch((e) => target.set({ error: String(e && e.message ? e.message : e) }))
+        .then(() => { if (explicit) target.set({ refreshing: false }) })
     }
 
     // Killing and re-spawning is the one action that fixes most start failures,
     // so it belongs next to the log that reports them.
-    const restartService = () => {
-      store.set({ restarting: true, error: null })
+    const restartService = (target = store) => {
+      target.set({ restarting: true, error: null })
       return host.call('restart').then((res) => {
-        store.set({
+        target.set({
           restarting: false,
           running: !!(res && res.ok),
-          diag: (res && res.diagnostics) || store.diag,
+          diag: (res && res.diagnostics) || target.diag,
           error: res && res.ok ? null : (res && res.error) || '重启失败',
         })
-        if (res && res.ok) refresh()
-      }).catch((e) => store.set({ restarting: false, error: String(e && e.message ? e.message : e) }))
+        if (res && res.ok) refresh(false, target)
+      }).catch((e) => target.set({ restarting: false, error: String(e && e.message ? e.message : e) }))
     }
 
-    const openFile = (path) => {
+    const openFile = (path, target = store) => {
       const file = String(path || '').trim()
       if (!file) return
-      store.set({ loading: true, error: null, pathInput: file })
+      target.set({ loading: true, error: null, pathInput: file })
       host.call('open', { file: file }).then((res) => {
         if (res && res.ok) {
           // Bump the nonce so re-opening the SAME file remounts the iframe:
           // with an unchanged `src` the browser would otherwise keep the old
           // document and "打开" would look like a no-op.
-          store.set({
+          target.set({
             loading: false,
             running: true,
             resolveState: 'exists',
             current: { path: file, url: res.url },
-            nonce: store.nonce + 1,
+            nonce: target.nonce + 1,
           })
         } else {
           // A failed open used to collapse into one opaque line. The host now
           // sends the journal along, so open the log on failure: the cause is
           // one glance away instead of a terminal session away.
-          store.set({
+          target.set({
             loading: false,
             error: (res && res.error) || 'open failed',
-            diag: (res && res.diagnostics) || store.diag,
+            diag: (res && res.diagnostics) || target.diag,
             diagOpen: !!(res && res.diagnostics),
           })
         }
-      }).catch((e) => store.set({ loading: false, error: String(e && e.message ? e.message : e) }))
+      }).catch((e) => target.set({ loading: false, error: String(e && e.message ? e.message : e) }))
     }
 
     const STATE_TITLE = {
@@ -608,25 +666,46 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 
     bindSendInterception()
 
+    // The workbench runs in an iframe, so its selections arrive as messages
+    // whenever one is open — in either seat, and independently of which file the
+    // panel happens to be showing. Bound with the plugin, not with the panel.
+    const onWorkbenchMessage = (event) => {
+      const data = event.data
+      if (!data || data.type !== 'html-workbench:context') return
+      if (!data.markdown) return
+      receiveContext(data)
+    }
+    window.addEventListener('message', onWorkbenchMessage)
+    ctx.effect(() => () => window.removeEventListener('message', onWorkbenchMessage))
 
-    const checkPath = (value) => {
+    const cancelPathCheck = (target) => {
+      if (target.resolveTimer) clearTimeout(target.resolveTimer)
+      target.resolveTimer = null
+      target.resolveSequence += 1
+    }
+
+    const checkPath = (value, target = store) => {
       const trimmed = (value || '').trim()
-      if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null }
-      if (!trimmed) { store.set({ resolveState: 'idle' }); return }
-      store.set({ resolveState: 'checking' })
-      resolveTimer = setTimeout(() => {
-        resolveTimer = null
+      cancelPathCheck(target)
+      const sequence = target.resolveSequence
+      if (!trimmed) { target.set({ resolveState: 'idle' }); return }
+      target.set({ resolveState: 'checking' })
+      target.resolveTimer = setTimeout(() => {
+        target.resolveTimer = null
         host.call('resolve', { file: trimmed }).then((res) => {
-          if (!res || res.ok === false) { store.set({ resolveState: 'idle' }); return }
-          if (!res.isHtml) store.set({ resolveState: 'invalid' })
-          else if (res.exists === true) store.set({ resolveState: 'exists' })
-          else if (res.exists === false) store.set({ resolveState: 'missing' })
+          if (sequence !== target.resolveSequence) return
+          if (!res || res.ok === false) { target.set({ resolveState: 'idle' }); return }
+          if (!res.isHtml) target.set({ resolveState: 'invalid' })
+          else if (res.exists === true) target.set({ resolveState: 'exists' })
+          else if (res.exists === false) target.set({ resolveState: 'missing' })
           // `exists: null` means the CHECK could not run (no interpreter, no
           // shell). Staying silent made the field look unresponsive, so promote
           // the host's reason to the banner instead of dropping it.
-          else if (res.error) store.set({ resolveState: 'idle', error: res.error })
-          else store.set({ resolveState: 'idle' })
-        }).catch((e) => store.set({ resolveState: 'idle', error: String(e && e.message ? e.message : e) }))
+          else if (res.error) target.set({ resolveState: 'idle', error: res.error })
+          else target.set({ resolveState: 'idle' })
+        }).catch((e) => {
+          if (sequence === target.resolveSequence) target.set({ resolveState: 'idle', error: String(e && e.message ? e.message : e) })
+        })
       }, 300)
     }
 
@@ -653,12 +732,15 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     const I_FILE = icon(14, [path('M14 3v5h5', 'a'), path('M15 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7Z', 'b')])
     const I_ALERT = icon(14, [React.createElement('circle', { cx: 12, cy: 12, r: 9, key: 'a' }), path('M12 8v4', 'b'), path('M12 16h.01', 'c')])
     const I_BLANK = icon(22, [path('M14 3v5h5', 'a'), path('M15 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7Z', 'b'), path('m9 15 1.8-2.2L12.4 15l1.4-1.8', 'c')])
-    const I_TRIGGER = icon(17, [
+    // One drawing serves both seats: the floating panel's corner trigger and the
+    // tab chip the sidebar renders from the descriptor's `icon`.
+    const triggerGlyph = (size) => icon(size, [
       React.createElement('rect', { x: 2.5, y: 4, width: 19, height: 14, rx: 2.4, key: 'a' }),
       path('M2.5 8.4h19', 'b'),
       path('M8 21h8', 'c'),
       path('M12 18v3', 'd'),
     ])
+    const I_TRIGGER = triggerGlyph(17)
     const I_LOGS = icon(15, [path('M8 6h10', 'a'), path('M8 12h10', 'b'), path('M8 18h6', 'c'), path('M4 6h.01', 'd'), path('M4 12h.01', 'e'), path('M4 18h.01', 'f')])
 
     // ── Diagnostics view ─────────────────────────────────────────────────────
@@ -675,8 +757,8 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       } catch (e) { return '' }
     }
 
-    const Diagnostics = () => {
-      const s = useStore()
+    const Diagnostics = ({ panelStore }) => {
+      const s = useStore(panelStore)
       const d = s.diag
       const journal = (d && d.journal) || []
       const [copied, setCopied] = React.useState(false)
@@ -721,9 +803,9 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         const text = lines.join('\n')
         const done = () => { setCopied(true); setTimeout(() => setCopied(false), 1600) }
         if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(done, () => store.set({ error: '复制失败，请手动访问 /html-workbench/diagnostics 获取原始信息。' }))
+          navigator.clipboard.writeText(text).then(done, () => panelStore.set({ error: '复制失败，请手动访问 /html-workbench/diagnostics 获取原始信息。' }))
         } else {
-          store.set({ error: '当前环境不支持剪贴板，请访问 /html-workbench/diagnostics 获取原始信息。' })
+          panelStore.set({ error: '当前环境不支持剪贴板，请访问 /html-workbench/diagnostics 获取原始信息。' })
         }
       }
 
@@ -737,11 +819,11 @@ header:has([data-slot="conversation.session.header.utilities"]) {
           }, copied ? '已复制' : '复制报告'),
           React.createElement('button', {
             type: 'button', className: 'hwb-btn hwb-btn-quiet hwb-btn-sm',
-            disabled: s.restarting, onClick: restartService,
+            disabled: s.restarting, onClick: () => restartService(panelStore),
           }, s.restarting ? '重启中…' : '重启服务'),
           React.createElement('button', {
             type: 'button', className: 'hwb-icon', title: '收起诊断', 'aria-label': '收起诊断',
-            onClick: () => store.set({ diagOpen: false }),
+            onClick: () => panelStore.set({ diagOpen: false }),
           }, I_CLOSE),
         ),
         d
@@ -818,41 +900,46 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     }
 
     // ── Panel ────────────────────────────────────────────────────────────────
-    const Panel = () => {
-      const s = useStore()
+    //
+    // One component for both seats. `placement` names the seat it was mounted
+    // into and the store says which seat is live, so a handed-over seat renders
+    // nothing. Only the floating seat carries the resize handle and the close
+    // button — the sidebar owns that tab's width and its closing.
+    const Panel = ({ placement, visible }) => {
+      const overlay = placement === 'overlay'
+      const layout = useStore()
+      const [localStore] = React.useState(createStore)
+      const store = overlay ? layout : localStore
+      const s = useStore(store)
+      // The floating seat draws only while it is the live one and open; the
+      // sidebar's body exists exactly as long as its tab does, so it always
+      // draws and only pauses what it polls.
+      const live = overlay ? layout.seat === 'overlay' && layout.open : true
       const [menuOpen, setMenuOpen] = React.useState(false)
       const [focused, setFocused] = React.useState(false)
       const fieldRef = React.useRef(null)
       const inputRef = React.useRef(null)
 
       React.useEffect(() => {
+        if (!overlay) return undefined
         const root = document.documentElement
-        root.style.setProperty('--hwb-panel-width', s.open ? s.panelWidth + 'px' : '0px')
+        root.style.setProperty('--hwb-panel-width', live ? s.panelWidth + 'px' : '0px')
         return () => { root.style.setProperty('--hwb-panel-width', '0px') }
-      }, [s.open, s.panelWidth])
+      }, [overlay, live, s.panelWidth])
 
+      // Poll while the panel is on screen: the floating one while it is open,
+      // the tabbed one while its tab is the active one. A backgrounded tab keeps
+      // rendering on purpose — its iframe holds whatever the user was editing.
+      const polling = overlay ? live : visible !== false
       React.useEffect(() => {
-        if (!s.open) return undefined
-        refresh()
-        const dispose = ctx.interval(refresh, 4000)
+        if (!polling) return undefined
+        refresh(false, store)
+        const dispose = ctx.interval(() => refresh(false, store), 4000)
         return () => { if (dispose) dispose() }
-      }, [s.open])
-
-      // The workbench runs in an iframe, so its selections arrive as messages.
-      // Bind while the panel is mounted, regardless of which file is open.
-      React.useEffect(() => {
-        const onMessage = (event) => {
-          const data = event.data
-          if (!data || data.type !== 'html-workbench:context') return
-          if (!data.markdown) return
-          receiveContext(data)
-        }
-        window.addEventListener('message', onMessage)
-        return () => window.removeEventListener('message', onMessage)
-      }, [])
+      }, [polling, store])
 
       // Drop any in-flight path check when the panel closes.
-      React.useEffect(() => () => { if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null } }, [])
+      React.useEffect(() => () => cancelPathCheck(store), [store])
 
       React.useEffect(() => {
         if (!menuOpen) return undefined
@@ -863,13 +950,13 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
       }, [menuOpen])
 
-      if (!s.open) return null
+      if (!live) return null
 
       const assets = s.assets || []
       const trimmed = (s.pathInput || '').trim()
       const currentPath = s.current ? s.current.path : null
-      const submit = () => { if (trimmed) { setMenuOpen(false); openFile(trimmed) } }
-      const pick = (p) => { setMenuOpen(false); store.set({ pathInput: p }); openFile(p) }
+      const submit = () => { if (trimmed) { setMenuOpen(false); openFile(trimmed, store) } }
+      const pick = (p) => { setMenuOpen(false); store.set({ pathInput: p }); openFile(p, store) }
 
       const assetRow = (a, inMenu) => React.createElement('button', {
         key: a.id || a.path,
@@ -913,7 +1000,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
               React.createElement('div', { style: { display: 'flex', gap: '8px' } },
                 React.createElement('button', {
                   type: 'button', className: 'hwb-btn hwb-btn-primary hwb-btn-sm',
-                  disabled: s.restarting, onClick: restartService,
+                  disabled: s.restarting, onClick: () => restartService(store),
                 }, s.restarting ? '重启中…' : '重启服务'),
                 React.createElement('button', {
                   type: 'button', className: 'hwb-btn hwb-btn-quiet hwb-btn-sm',
@@ -939,24 +1026,27 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 
       return React.createElement('div', {
         className: 'hwb-panel',
-        style: { width: s.panelWidth + 'px', maxWidth: 'calc(100vw - 24px)' },
+        'data-seat': overlay ? 'overlay' : 'sidebar',
+        style: overlay ? { width: s.panelWidth + 'px', maxWidth: 'calc(100vw - 24px)' } : undefined,
         role: 'complementary',
         'aria-label': 'HTML Workbench',
       },
-        React.createElement('div', {
-          className: 'hwb-resize',
-          role: 'separator',
-          'aria-orientation': 'vertical',
-          'aria-label': '调整面板宽度',
-          tabIndex: 0,
-          title: '拖动调整宽度（双击复位）',
-          onMouseDown: startResize,
-          onDoubleClick: () => { store.set({ panelWidth: DEFAULT_WIDTH }); writeWidth(DEFAULT_WIDTH) },
-          onKeyDown: (e) => {
-            if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeWidth(32) }
-            else if (e.key === 'ArrowRight') { e.preventDefault(); nudgeWidth(-32) }
-          },
-        }),
+        overlay
+          ? React.createElement('div', {
+            className: 'hwb-resize',
+            role: 'separator',
+            'aria-orientation': 'vertical',
+            'aria-label': '调整面板宽度',
+            tabIndex: 0,
+            title: '拖动调整宽度（双击复位）',
+            onMouseDown: startResize,
+            onDoubleClick: () => { store.set({ panelWidth: DEFAULT_WIDTH }); writeWidth(DEFAULT_WIDTH) },
+            onKeyDown: (e) => {
+              if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeWidth(32) }
+              else if (e.key === 'ArrowRight') { e.preventDefault(); nudgeWidth(-32) }
+            },
+          })
+          : null,
 
         React.createElement('div', { className: 'hwb-chrome' },
           React.createElement('div', { className: 'hwb-idrow' },
@@ -988,17 +1078,20 @@ header:has([data-slot="conversation.session.header.utilities"]) {
               React.createElement('button', {
                 type: 'button', className: 'hwb-icon', title: '刷新产物列表',
                 'aria-label': '刷新产物列表', 'data-spin': s.refreshing ? '' : undefined,
-                onClick: () => refresh(true),
+                onClick: () => refresh(true, store),
               }, I_REFRESH),
               React.createElement('button', {
                 type: 'button', className: 'hwb-icon', title: '在浏览器标签页中打开',
                 'aria-label': '在浏览器标签页中打开', disabled: !(s.current && s.current.url),
                 onClick: () => { if (s.current && s.current.url) window.open(s.current.url, '_blank', 'noopener') },
               }, I_EXTERNAL),
-              React.createElement('button', {
-                type: 'button', className: 'hwb-icon', title: '关闭面板',
-                'aria-label': '关闭面板', onClick: () => store.set({ open: false }),
-              }, I_CLOSE),
+              // The tabbed panel is closed from the sidebar's own tab strip.
+              overlay
+                ? React.createElement('button', {
+                  type: 'button', className: 'hwb-icon', title: '关闭面板',
+                  'aria-label': '关闭面板', onClick: () => store.set({ open: false }),
+                }, I_CLOSE)
+                : null,
             ),
           ),
 
@@ -1014,7 +1107,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
                   spellCheck: false,
                   autoComplete: 'off',
                   'aria-label': 'HTML 文件绝对路径',
-                  onChange: (e) => { const v = e.target.value; store.set({ pathInput: v }); checkPath(v) },
+                  onChange: (e) => { const v = e.target.value; store.set({ pathInput: v }); checkPath(v, store) },
                   onKeyDown: (e) => {
                     if (e.key === 'Enter') submit()
                     else if (e.key === 'ArrowDown' && assets.length) { e.preventDefault(); setMenuOpen(true) }
@@ -1072,7 +1165,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
           )
           : null,
 
-        s.diagOpen ? React.createElement(Diagnostics) : null,
+        s.diagOpen ? React.createElement(Diagnostics, { panelStore: store }) : null,
 
         React.createElement('div', { className: 'hwb-body' }, body),
       )
@@ -1080,7 +1173,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 
     const Trigger = () => {
       const s = useStore()
-      if (s.open) return null
+      if (s.seat !== 'overlay' || s.open) return null
       return React.createElement('button', {
         type: 'button',
         className: 'hwb-trigger',
@@ -1091,9 +1184,89 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       }, I_TRIGGER)
     }
 
+    // Prefer the native registry: DSH 0.2 needs keepMounted to preserve an
+    // iframe through tab/session changes. better-sidebar 0.24.1 does not yet
+    // forward that option. Its registry remains a fallback for older profiles.
+    const tabId = '@vibe-x/dsh-html-workbench'
+    let nativeReady = false
+    let legacyContext = null
+    let disposeLegacy = null
+    const syncSidebar = () => {
+      if (disposed) return
+      if (nativeReady && disposeLegacy) {
+        disposeLegacy()
+        disposeLegacy = null
+      }
+      if (!nativeReady && legacyContext && !disposeLegacy) {
+        disposeLegacy = legacyContext.effect(() => legacyContext.betterSidebar.registerTab({
+          id: 'html-workbench',
+          title: 'HTML Workbench',
+          description: '可视化预览与编辑 agent 生成的 HTML',
+          icon: triggerGlyph,
+          order: 60,
+          single: true,
+          component: (props) => React.createElement(Panel, {
+            key: JSON.stringify([props.scope && props.scope.sessionId, props.tab && props.tab.id]),
+            placement: 'sidebar',
+            visible: props.visible,
+          }),
+        }), 'html-workbench: legacy sidebar tab')
+      }
+      setSeat(nativeReady || disposeLegacy ? 'sidebar' : 'overlay')
+    }
+
+    ctx.inject(['sidebarRightTabs'], (nativeCtx) => {
+      if (!slots) return
+      // Release the legacy kind before registering the native implementation.
+      nativeReady = true
+      syncSidebar()
+      nativeCtx.effect(() => () => {
+        nativeReady = false
+        syncSidebar()
+      }, 'html-workbench: native fallback')
+      nativeCtx.effect(() => slots.inject('sidebar.right.pane.tab', () => slots.register({
+        name: 'sidebar.right.pane.tab',
+        key: tabId,
+        inject: (sessionId) => ({ sessionId }),
+      }, (props) => {
+        const tab = props.useTabInfo ? props.useTabInfo().tab : (props.tab || {})
+        return React.createElement(Panel, {
+          key: JSON.stringify([props.sessionId, tab.id]),
+          placement: 'sidebar',
+          visible: tab.visible,
+        })
+      })), 'html-workbench: native tab body')
+      nativeCtx.effect(() => nativeCtx.sidebarRightTabs.register({
+        id: tabId,
+        kind: 'html-workbench',
+        keepMounted: true,
+        title: () => 'HTML Workbench',
+        guide: [{
+          id: 'html-workbench',
+          order: 60,
+          title: () => 'HTML Workbench',
+          description: () => '可视化预览与编辑 agent 生成的 HTML',
+          icon: (props) => triggerGlyph(props.size || 16),
+        }],
+      }), 'html-workbench: native tab type')
+    })
+
+    ctx.inject(['betterSidebar'], (sidebarCtx) => {
+      legacyContext = sidebarCtx
+      syncSidebar()
+      sidebarCtx.effect(() => () => {
+        legacyContext = null
+        if (disposeLegacy) disposeLegacy()
+        disposeLegacy = null
+        syncSidebar()
+      }, 'html-workbench: legacy fallback')
+    })
+
+    if (slots === undefined) return
+
     slots.inject('shell.overlay', () => slots.register(
       { name: 'shell.overlay', id: 'html-workbench-panel', order: 60, label: 'HTML Workbench' },
-      () => React.createElement(Panel),
+      () => React.createElement(Panel, { placement: 'overlay' }),
     ))
 
     slots.inject('shell.overlay', () => slots.register(

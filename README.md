@@ -115,6 +115,7 @@ Read the [generation guide](./skill/html-workbench/references/editable-html-guid
 Source code stays in `service/`, `build/`, and `tests/`; the distributable Skill is maintained in `skill/html-workbench/`, and the DeepSeek Harness plugin in `dsh-plugin/`.
 
 ```bash
+npm install
 npm run build
 npm test
 ```
