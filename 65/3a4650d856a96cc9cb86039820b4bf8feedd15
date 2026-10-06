@@ -1,0 +1,37 @@
+dsh-plugin/src/client.js
+  s_c935c8163f4eec::t_706cf5dd53846e 271,291-292,307,309-313,315-316,323,325,340,349-355,403-404,408-409,411,414,416-417,422-423,425,428,431-432,435,438,444,449,455,458,462,1219
+  s_c935c8163f4eec::t_b389fadd14f33a 681-687,689-694,696-700,704-708,760-761,806,808,822,826,910-913,917,936-937,939,942,958-959,1003,1081,1110,1168,1187-1209
+  s_c935c8163f4eec::t_8d9f8b94780c3c 10-13,1210-1218,1220-1234,1236-1262
+README.md
+  s_c935c8163f4eec::t_6f14936000a804 118
+tests/client_hosts.test.mjs
+  s_c935c8163f4eec::t_b389fadd14f33a 30
+  s_c935c8163f4eec::t_52b22902553739 4-5,96,99,159,163
+tests/client_lifecycle.test.mjs
+  s_c935c8163f4eec::t_6f14936000a804 1-187
+  s_c935c8163f4eec::t_f50c8ca3db8369 188-255
+README.zh-CN.md
+  s_c935c8163f4eec::t_6f14936000a804 118
+dsh-plugin/README.md
+  s_c935c8163f4eec::t_3fefcb6b668e80 9,11-13,15-17
+package-lock.json
+  s_c935c8163f4eec::t_28effc24a2c720 1-160
+package.json
+  s_c935c8163f4eec::t_5efc6c3e23294f 12-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "653a4650d856a96cc9cb86039820b4bf8feedd15",
+  "prompts": {},
+  "sessions": {
+    "s_c935c8163f4eec": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a10f41-2f52-7890-a8fe-4d468667c19f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "周鸿轩 <zhouhongxuan@BakMacBook-Pro.local>"
+    }
+  }
+}
