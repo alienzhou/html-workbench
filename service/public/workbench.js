@@ -62,6 +62,11 @@ function api(route) {
   return `${route}?file=${encodeURIComponent(activeFile)}`
 }
 
+function requestError(response, message) {
+  const id = response.headers.get('X-Workbench-Request-Id')
+  return new Error(id ? `${message}（请求编号 ${id}）` : message)
+}
+
 // The HTML/JS assets are re-read from disk on every request, but a long-lived
 // service keeps running the Python it was started with. So a new frontend can
 // meet an old API, whose missing routes answer 501 with an HTML error page.
@@ -73,9 +78,9 @@ async function readJson(response) {
     return JSON.parse(text)
   } catch (error) {
     if (response.status === 501 || response.status === 404) {
-      throw new Error('本地服务是旧版本，缺少该接口。请重启 Workbench 服务后重试。')
+      throw requestError(response, '本地服务是旧版本，缺少该接口。请重启 Workbench 服务后重试。')
     }
-    throw new Error(`服务返回了非 JSON 响应（HTTP ${response.status}）。`)
+    throw requestError(response, `服务返回了非 JSON 响应（HTTP ${response.status}）。`)
   }
 }
 
@@ -499,12 +504,13 @@ async function sendSelectionToChat(element) {
       body: JSON.stringify({ selections: [selection] }),
     })
     const packet = await readJson(response)
-    if (!response.ok) throw new Error(packet.message || packet.error)
+    if (!response.ok) throw requestError(response, packet.message || packet.error)
     publishContext(packet)
     flashContextElement(element)
     showContextToast(`已添加 ${packet.selections[0]?.selector || described.label} 到对话`)
     setStatus('已添加到对话上下文', 'saved')
   } catch (error) {
+    console.error('[html-workbench] context failed', error)
     showContextToast(error.message || '生成上下文失败，请重新选择。', 'error')
     setStatus('添加到对话失败', 'error')
   } finally {
@@ -668,12 +674,13 @@ async function save() {
       await applyDocument(result.document)
       return
     }
-    if (!response.ok) throw new Error(result.message || result.error)
+    if (!response.ok) throw requestError(response, result.message || result.error)
     revision = result.revision
     bodyScripts = result.bodyScripts || bodyScripts
     dirty = false
     setStatus('已与磁盘同步', 'saved')
   } catch (error) {
+    console.error('[html-workbench] save failed', error)
     setStatus(error.message || '保存失败', 'error')
   }
 }
@@ -715,7 +722,7 @@ async function loadFile(file = activeFile) {
     activeFile = file
     const response = await fetch(api('/api/document'))
     const document = await readJson(response)
-    if (!response.ok) throw new Error(document.message || document.error)
+    if (!response.ok) throw requestError(response, document.message || document.error)
     await applyDocument(document)
     dirty = false
     connectEvents()
@@ -725,6 +732,7 @@ async function loadFile(file = activeFile) {
     setFilePopover(false)
     setStatus('已与磁盘同步', 'saved')
   } catch (error) {
+    console.error('[html-workbench] load failed', error)
     setStatus(error.message || '加载失败', 'error')
   }
 }
@@ -748,7 +756,14 @@ function saveAttribute(name, input) {
   scheduleSave()
 }
 
-initEditor()
+try {
+  if (!grapesjs) throw new Error('GrapesJS 未加载。请检查浏览器网络记录和服务日志。')
+  initEditor()
+} catch (error) {
+  console.error('[html-workbench] editor initialization failed', error)
+  setStatus(error.message || '编辑器初始化失败', 'error')
+  throw error
+}
 document.querySelector('#open-button').addEventListener('click', () => loadFile(fileInput.value.trim()))
 fileInput.addEventListener('keydown', (event) => { if (event.key === 'Enter') loadFile(fileInput.value.trim()) })
 fileMenuButton.addEventListener('click', () => setFilePopover(filePopover.hidden))

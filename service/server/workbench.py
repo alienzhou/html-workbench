@@ -14,6 +14,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,8 +115,10 @@ def default_vendor_cache() -> Path:
     return base / "html-workbench" / "vendor" / "grapesjs" / GRAPESJS_VERSION
 
 
-LOG_MAX_BYTES = 1_000_000
+LOG_MAX_BYTES = 1024 * 1024
 LOG_BACKUP_COUNT = 5
+LOG_RECORD_MAX_BYTES = 16 * 1024
+BOOTSTRAP_MAX_BYTES = 256 * 1024
 
 
 def default_log_dir() -> Path:
@@ -198,7 +202,7 @@ def self_ignore(directory: Path) -> None:
         pass
 
 
-def pick_writable_dir(*candidates: Path) -> Path:
+def pick_writable_dir(*candidates: Path, failures: list[str] | None = None) -> Path:
     """Return the first candidate directory this process can really write into.
 
     Existence proves nothing: the sandbox DACL looks writable on paper while the
@@ -209,18 +213,15 @@ def pick_writable_dir(*candidates: Path) -> Path:
     still gets a deterministic path (and a clear error at the real write).
     """
     fallback: Path | None = None
-    for candidate in candidates:
-        if candidate is None:
-            continue
+    for candidate in dict.fromkeys(candidates):
         if fallback is None:
             fallback = candidate
         try:
             candidate.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            continue
-        try:
             descriptor, probe = make_temp_file(candidate, prefix=".wb-write-probe.")
-        except OSError:
+        except OSError as caught:
+            if failures is not None:
+                failures.append(f"{candidate}: {caught}")
             continue
         os.close(descriptor)
         try:
@@ -237,7 +238,7 @@ def log_candidates(log_dir: Path | str) -> tuple[Path, ...]:
     return (
         Path(log_dir).expanduser(),
         runtime_directory() / "logs",
-        Path(tempfile.gettempdir()) / RUNTIME_DIR_NAME / "logs",
+        temporary_runtime_directory() / "logs",
     )
 
 
@@ -251,8 +252,94 @@ def vendor_candidates(vendor_cache: Path | str, log_dir: Path) -> tuple[Path, ..
         Path(vendor_cache).expanduser(),
         Path(log_dir).parent / "vendor",
         runtime_directory() / "vendor",
-        Path(tempfile.gettempdir()) / RUNTIME_DIR_NAME / "vendor",
+        temporary_runtime_directory() / "vendor",
     )
+
+def temporary_runtime_directory() -> Path:
+    try:
+        return Path(tempfile.gettempdir()) / RUNTIME_DIR_NAME
+    except OSError:
+        # A denied TEMP must not prevent trying the explicitly supplied directory.
+        return runtime_directory()
+
+
+def bounded_utf8(text: str, limit: int) -> bytes:
+    data = text.encode("utf-8", errors="backslashreplace")
+    if len(data) <= limit:
+        return data
+    marker = b"\n...[truncated]...\n"
+    remaining = limit - len(marker)
+    head = data[:remaining // 3].decode("utf-8", errors="ignore").encode("utf-8")
+    tail = data[-(remaining - remaining // 3):].decode("utf-8", errors="ignore").encode("utf-8")
+    return head + marker + tail
+
+
+class BoundedRotatingFileHandler(RotatingFileHandler):
+    """Bound UTF-8 bytes, including exception stacks; back off on disk failures."""
+
+    last_error: str | None = None
+    dropped_records = 0
+    retry_at = 0.0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if time.monotonic() < self.retry_at:
+            self.dropped_records += 1
+            return
+        try:
+            data = bounded_utf8(self.format(record), min(LOG_RECORD_MAX_BYTES, self.maxBytes) - 1) + b"\n"
+            if self.stream is None:
+                self.stream = self._open()
+            if os.fstat(self.stream.fileno()).st_size + len(data) > self.maxBytes:
+                self.doRollover()
+            # Binary writes avoid Windows newline translation and count CJK bytes.
+            self.stream.buffer.write(data)
+            self.stream.flush()
+            self.last_error = None
+        except Exception as caught:
+            self.last_error = str(caught)[:500]
+            self.dropped_records += 1
+            self.retry_at = time.monotonic() + 60
+            try:
+                print(json.dumps({"event": "log_write_failed", "message": self.last_error}), file=sys.stderr, flush=True)
+            except OSError:
+                pass
+
+
+class BoundedOutput(io.TextIOBase):
+    """Cap the detached child's combined stdout/stderr, including library output."""
+
+    def __init__(self, output: Any) -> None:
+        self.output = output
+        self.lock = threading.Lock()
+        self.full = False
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    def write(self, text: str) -> int:
+        with self.lock:
+            if self.full:
+                return len(text)
+            try:
+                remaining = BOOTSTRAP_MAX_BYTES - os.fstat(self.output.fileno()).st_size
+                data = text.encode("utf-8", errors="backslashreplace")
+                marker = b"\n[bootstrap output limit reached]\n"
+                if len(data) + len(marker) > remaining:
+                    self.full = True
+                    data = data[:max(0, remaining - len(marker))].decode("utf-8", errors="ignore").encode("utf-8")
+                    data += marker[:max(0, remaining - len(data))]
+                self.output.write(data)
+                self.output.flush()
+            except OSError:
+                self.full = True
+        return len(text)
+
+    def flush(self) -> None:
+        try:
+            self.output.flush()
+        except (OSError, ValueError):
+            pass
 
 
 _logger: logging.Logger | None = None
@@ -286,8 +373,8 @@ def setup_logging(log_dir: Path | str, port: int | None = None) -> tuple[logging
     swallowed and the service runs without a file log rather than never binding
     its port.
     """
-    global _logger
-    directory = pick_writable_dir(*log_candidates(log_dir))
+    failures: list[str] = []
+    directory = pick_writable_dir(*log_candidates(log_dir), failures=failures)
     filename = f"workbench-{port}.log" if port is not None else "workbench.log"
     logger = get_logger()
     for existing in list(logger.handlers):
@@ -296,16 +383,24 @@ def setup_logging(log_dir: Path | str, port: int | None = None) -> tuple[logging
             logger.removeHandler(existing)
     logger.setLevel(logging.INFO)
     try:
-        handler = RotatingFileHandler(
+        handler = BoundedRotatingFileHandler(
             directory / filename,
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,
             encoding="utf-8",
         )
-    except OSError:
+    except OSError as caught:
+        print(json.dumps({
+            "level": "warning", "event": "log_file_unavailable",
+            "message": str(caught), "attempts": failures,
+        }, ensure_ascii=False), file=sys.stderr, flush=True)
         return logger, directory
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    formatter = logging.Formatter("%(asctime)s.%(msecs)03dZ %(levelname)s pid=%(process)d %(message)s", "%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
+    for failure in failures:
+        logger.warning("log_directory_rejected %s", failure)
     return logger, directory
 
 
@@ -373,13 +468,15 @@ def write_vendor_cache(cache_dir: Path, files: dict[str, bytes]) -> None:
 
 
 def ensure_vendor_assets(cache_dir: Path) -> dict[str, Path]:
+    logger = get_logger()
     paths = {name: cache_dir / name for name in VENDOR_ASSETS}
     try:
         for name, path in paths.items():
             verify_vendor_content(name, path.read_bytes())
+        logger.info("vendor_cache_ready grapesjs=%s", GRAPESJS_VERSION)
         return paths
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as caught:
+        logger.info("vendor_cache_miss grapesjs=%s reason=%s", GRAPESJS_VERSION, caught)
 
     failures: list[str] = []
     sources = [
@@ -387,12 +484,23 @@ def ensure_vendor_assets(cache_dir: Path) -> dict[str, Path]:
         *((name, url, vendor_from_cdn) for name, url in VENDOR_CDNS),
     ]
     for source_name, url, loader in sources:
+        started = time.monotonic()
         try:
+            logger.info("vendor_download_start source=%s", source_name)
             files = loader(url)
-            write_vendor_cache(cache_dir, files)
-            return paths
         except (OSError, ValueError, tarfile.TarError, urllib.error.URLError) as caught:
             failures.append(f"{source_name}: {caught}")
+            logger.warning("vendor_download_failed source=%s elapsed_ms=%.0f reason=%s",
+                           source_name, (time.monotonic() - started) * 1000, caught)
+            continue
+        try:
+            write_vendor_cache(cache_dir, files)
+        except (OSError, ValueError) as caught:
+            failures.append(f"{source_name} cache write: {caught}")
+            logger.warning("vendor_cache_write_failed source=%s reason=%s", source_name, caught)
+            continue
+        logger.info("vendor_download_ready source=%s elapsed_ms=%.0f", source_name, (time.monotonic() - started) * 1000)
+        return paths
     raise WorkbenchError(
         "VENDOR_DOWNLOAD_FAILED",
         "首次启动需要下载约 1.2 MB 的 GrapesJS，但所有下载源均不可用。请检查网络后重试。",
@@ -1399,6 +1507,7 @@ class WorkbenchServer(ThreadingHTTPServer):
         vendor_files: dict[str, Path],
         log_dir: Path | None = None,
         vendor_cache: Path | None = None,
+        log_file: Path | None = None,
     ) -> None:
         self.asset_file = asset_file.resolve(strict=True)
         self.editor_root = editor_root.resolve(strict=True)
@@ -1409,6 +1518,7 @@ class WorkbenchServer(ThreadingHTTPServer):
         # startup output to read them from.
         self.log_dir = Path(log_dir) if log_dir is not None else None
         self.vendor_cache = Path(vendor_cache) if vendor_cache is not None else None
+        self.log_file = log_file
         super().__init__(address, WorkbenchHandler)
 
 
@@ -1416,10 +1526,42 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     server: WorkbenchServer
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, format_string: str, *args: Any) -> None:
-        message = format_string % args
-        get_logger().info("%s %s", self.log_date_time_string(), message)
-        sys.stderr.write(f"{self.log_date_time_string()} {message}\n")
+    def handle_one_request(self) -> None:
+        self.request_id = secrets.token_hex(6)
+        self.request_started = time.monotonic()
+        self.error_code = None
+        self.file_ref = "-"
+        super().handle_one_request()
+
+    def parse_request(self) -> bool:
+        # The connection may sit idle before its next request line arrives.
+        self.request_started = time.monotonic()
+        return super().parse_request()
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        route = getattr(self, "path", "").partition("?")[0]
+        if route == "/api/health" and code == 200:
+            return
+        if route.startswith("/assets/"):
+            route = "/assets/*"
+        elif route not in {"/", "/api/health", "/api/document", "/api/events", "/api/context", "/api/anchor", "/api/shutdown"}:
+            route = route if route in self.server.vendor_routes else "other"
+        status = int(code) if str(code).isdigit() else 0
+        level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 else logging.INFO
+        method = self.command if self.command in {"GET", "PUT", "POST", "HEAD", "OPTIONS"} else "other"
+        get_logger().log(level, "http_request id=%s method=%s route=%s status=%s elapsed_ms=%.1f code=%s file_ref=%s",
+                         self.request_id, method, route, code,
+                         (time.monotonic() - self.request_started) * 1000, self.error_code or "-", self.file_ref)
+
+    def log_error(self, format_string: str, *args: Any) -> None:
+        # Base HTTP errors also pass through log_request. Skip the raw message,
+        # which can contain user-controlled request text.
+        if format_string.startswith("Request timed out"):
+            get_logger().warning("http_timeout id=%s", self.request_id)
+
+    def end_headers(self) -> None:
+        self.send_header("X-Workbench-Request-Id", self.request_id)
+        super().end_headers()
 
     def send_bytes(self, status: int, content: bytes, content_type: str, cache: str = "no-store") -> None:
         self.send_response(status)
@@ -1436,29 +1578,38 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
+        if status >= 400:
+            self.error_code = payload.get("error")
         content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_bytes(status, content, "application/json; charset=utf-8")
 
     def send_error_payload(self, caught: Exception) -> None:
         if isinstance(caught, WorkbenchError):
-            get_logger().warning("request failed: %s (%s)", caught.code, caught)
+            get_logger().warning("request_failed id=%s code=%s reason=%s", self.request_id, caught.code, caught)
             self.send_json(caught.status, {"error": caught.code, "message": str(caught), **caught.extra})
         else:
-            get_logger().exception("unhandled request error")
+            get_logger().exception("request_failed id=%s code=SERVER_ERROR", self.request_id)
             self.send_json(500, {"error": "SERVER_ERROR", "message": str(caught)})
 
     def query_file(self, query: dict[str, list[str]]) -> Path:
-        return resolve_html_file(query.get("file", [""])[0])
+        raw = query.get("file", [""])[0]
+        self.file_ref = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        return resolve_html_file(raw)
 
     def do_GET(self) -> None:
-        parsed = urllib.parse.urlsplit(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
         try:
+            parsed = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
             if parsed.path == "/api/health":
                 payload: dict[str, Any] = {
                     "ok": True,
                     "service": SERVICE_NAME,
                     "version": SERVICE_VERSION,
+                    "pythonVersion": ".".join(map(str, sys.version_info[:3])),
+                    "pythonExecutable": sys.executable,
+                    "platform": sys.platform,
+                    "pid": os.getpid(),
+                    "logging": logging_status(),
                     "port": self.server.server_port,
                     "editorRoot": str(self.server.editor_root),
                     "capabilities": list(SERVICE_CAPABILITIES),
@@ -1469,6 +1620,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 # be exactly what the sandbox refused.
                 if self.server.log_dir is not None:
                     payload["logDir"] = str(self.server.log_dir)
+                    payload["logFile"] = str(self.server.log_file) if self.server.log_file is not None else None
                 if self.server.vendor_cache is not None:
                     payload["vendorCache"] = str(self.server.vendor_cache)
                 self.send_json(200, payload)
@@ -1494,23 +1646,25 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.send_error_payload(caught)
 
     def do_PUT(self) -> None:
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path != "/api/document":
-            self.send_json(404, {"error": "NOT_FOUND", "message": "接口不存在。"})
-            return
         try:
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path != "/api/document":
+                self.send_json(404, {"error": "NOT_FOUND", "message": "接口不存在。"})
+                return
             body = self.read_json_body()
             query = urllib.parse.parse_qs(parsed.query)
             self.send_json(200, save_document(self.query_file(query), body))
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except json.JSONDecodeError as caught:
             self.send_error_payload(WorkbenchError("INVALID_SAVE", f"保存请求不是有效 JSON：{caught}", 400))
         except Exception as caught:
             self.send_error_payload(caught)
 
     def do_POST(self) -> None:
-        parsed = urllib.parse.urlsplit(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
         try:
+            parsed = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
             if parsed.path == "/api/shutdown":
                 # Lets a newer `open` retire this process cleanly. The service
                 # holds no state of its own, so exiting is always safe.
@@ -1533,6 +1687,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self.send_json(200, promote_identities(target, selections, str(body.get("baseRevision") or "")))
                 return
             self.send_json(200, build_selection_context(target, selections))
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except json.JSONDecodeError as caught:
             self.send_error_payload(WorkbenchError("INVALID_ANCHOR", f"请求不是有效 JSON：{caught}", 400))
         except Exception as caught:
@@ -1565,15 +1721,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         last_revision = ""
+        missing = False
         while True:
             try:
                 document = read_document(target)
+                missing = False
                 if document["revision"] != last_revision:
                     last_revision = document["revision"]
                     payload = json.dumps({"revision": last_revision, "mtimeMs": document["mtimeMs"]}, separators=(",", ":"))
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
             except FileNotFoundError:
+                if not missing:
+                    get_logger().warning("file_watch_missing id=%s code=FILE_NOT_FOUND", self.request_id)
+                    missing = True
                 self.wfile.write(b'event: error\ndata: {"error":"FILE_NOT_FOUND"}\n\n')
                 self.wfile.flush()
             time.sleep(0.5)
@@ -1586,12 +1747,19 @@ def default_asset_file(script_file: Path) -> Path:
     raise WorkbenchError("ASSET_NOT_FOUND", f"找不到前端资源：{packaged}", 500)
 
 
-def health(port: int, timeout: float = 0.5) -> dict[str, Any] | None:
+def health(port: int, timeout: float = 0.5, failures: list[str] | None = None) -> dict[str, Any] | None:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        return payload if payload.get("service") == SERVICE_NAME else None
-    except (OSError, ValueError, urllib.error.URLError):
+            content = response.read(64 * 1024 + 1)
+        if len(content) > 64 * 1024:
+            raise ValueError("health response exceeds 64 KiB")
+        payload = json.loads(content.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("service") != SERVICE_NAME:
+            raise ValueError("port responded with a different service identity")
+        return payload
+    except (OSError, ValueError, urllib.error.URLError) as caught:
+        if failures is not None:
+            failures.append(type(caught).__name__ + ": " + str(caught)[:1000])
         return None
 
 
@@ -1709,7 +1877,7 @@ def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: 
     """
     directory = pick_writable_dir(*log_candidates(log_dir))
     log_file: Path | None = directory / f"html-workbench-{port}.log"
-    command = [sys.executable, str(script_file), "serve", "--port", str(port), "--editor-root", str(editor_root), "--vendor-cache", str(vendor_cache), "--log-dir", str(directory)]
+    command = [sys.executable, str(script_file), "serve", "--bounded-output", "--port", str(port), "--editor-root", str(editor_root), "--vendor-cache", str(vendor_cache), "--log-dir", str(directory)]
     if asset_file is not None:
         command.extend(["--asset", str(asset_file)])
     flags = 0
@@ -1719,7 +1887,14 @@ def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: 
         kwargs["creationflags"] = flags
         kwargs.pop("start_new_session", None)
     try:
-        log = log_file.open("ab")
+        if log_file.is_file():
+            # Migrate historical unbounded output using a bounded tail read.
+            with log_file.open("rb") as previous:
+                previous.seek(max(0, os.fstat(previous.fileno()).st_size - BOOTSTRAP_MAX_BYTES))
+                # A tail offset can bisect a multibyte character in old logs.
+                tail = previous.read(BOOTSTRAP_MAX_BYTES).decode("utf-8", errors="replace")
+                log_file.with_suffix(".log.1").write_bytes(bounded_utf8(tail, BOOTSTRAP_MAX_BYTES))
+        log = log_file.open("wb")
     except OSError:
         log_file = None
         log = None
@@ -1739,14 +1914,20 @@ def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: 
 
 def command_serve(args: argparse.Namespace, script_file: Path) -> int:
     logger, log_directory = setup_logging(args.log_dir, args.port)
+    log_file = service_log_file(logger)
+    logger.info("service_starting version=%s python=%s platform=%s port=%s executable=%s cwd=%s",
+                SERVICE_VERSION, sys.version.split()[0], sys.platform, args.port, sys.executable, Path.cwd())
     asset_file = Path(args.asset).expanduser().resolve(strict=True) if args.asset else default_asset_file(script_file)
     editor_root = Path(args.editor_root).expanduser().resolve(strict=True)
     # Logs and cache are both disposable, so they follow the writable location the
     # sandbox really granted instead of the path the parent requested.
-    vendor_cache = pick_writable_dir(*vendor_candidates(args.vendor_cache, log_directory))
+    failures: list[str] = []
+    vendor_cache = pick_writable_dir(*vendor_candidates(args.vendor_cache, log_directory), failures=failures)
+    for failure in failures:
+        logger.warning("vendor_directory_rejected %s", failure)
     vendor_files = ensure_vendor_assets(vendor_cache)
-    server = WorkbenchServer(("127.0.0.1", args.port), asset_file, editor_root, vendor_files, log_directory, vendor_cache)
-    logger.info("service started: port=%s editorRoot=%s logDir=%s vendorCache=%s", args.port, editor_root, log_directory, vendor_cache)
+    server = WorkbenchServer(("127.0.0.1", args.port), asset_file, editor_root, vendor_files, log_directory, vendor_cache, log_file)
+    logger.info("service_ready port=%s editorRoot=%s logFile=%s vendorCache=%s", args.port, editor_root, log_file, vendor_cache)
     # The host surfaces these two paths in its diagnostics, so the panel shows the
     # directories actually in use rather than echoing the ones it asked for — the
     # requested ones may be exactly what the sandbox refused.
@@ -1755,6 +1936,7 @@ def command_serve(args: argparse.Namespace, script_file: Path) -> int:
         "url": f"http://127.0.0.1:{args.port}",
         "editorRoot": str(editor_root),
         "logDir": str(log_directory),
+        "logFile": str(log_file) if log_file is not None else None,
         "vendorCache": str(vendor_cache),
     }, ensure_ascii=False), flush=True)
     try:
@@ -1763,7 +1945,7 @@ def command_serve(args: argparse.Namespace, script_file: Path) -> int:
         pass
     finally:
         server.server_close()
-        logger.info("service stopped: port=%s", args.port)
+        logger.info("service_stopped port=%s", args.port)
     return 0
 
 
@@ -1817,6 +1999,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--asset", help="override the bundled workbench.html path")
     serve.add_argument("--vendor-cache", default=str(default_vendor_cache()), help="directory for verified GrapesJS files")
     serve.add_argument("--log-dir", default=str(default_log_dir()), help="directory for rotating service logs")
+    serve.add_argument("--bounded-output", action="store_true", help=argparse.SUPPRESS)
 
     open_command = subparsers.add_parser("open", help="start or reuse the service and print an editor URL")
     open_command.add_argument("file")
@@ -1851,11 +2034,48 @@ def command_stop(args: argparse.Namespace) -> int:
     raise WorkbenchError("SERVER_OUTDATED", f"端口 {args.port} 上的进程无法停止，请手动结束后重试。", 500)
 
 
+def service_log_file(logger: logging.Logger) -> Path | None:
+    for handler in logger.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            return Path(handler.baseFilename)
+    return None
+
+
+def logging_status() -> dict[str, Any]:
+    for handler in get_logger().handlers:
+        if isinstance(handler, BoundedRotatingFileHandler):
+            return {
+                "file": handler.baseFilename, "error": handler.last_error,
+                "droppedRecords": handler.dropped_records,
+                "maxBytes": LOG_MAX_BYTES, "backups": LOG_BACKUP_COUNT,
+                "recordMaxBytes": LOG_RECORD_MAX_BYTES,
+            }
+    return {"file": None, "error": "file logging unavailable"}
+
+
+def report_cli_error(command: str, code: str, caught: Exception, **details: Any) -> int:
+    payload = {"ok": False, "error": code, "message": str(caught), **details}
+    if command == "serve":
+        logger = get_logger()
+        log_file = service_log_file(logger)
+        payload["logFile"] = str(log_file) if log_file is not None else None
+        logger.exception("service_failed code=%s", code)
+        if log_file is None or logging_status().get("error"):
+            print(bounded_utf8(traceback.format_exc(), LOG_RECORD_MAX_BYTES).decode("utf-8"), file=sys.stderr)
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+    return 1
+
+
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     if sys.version_info < (3, 9):
         print(json.dumps({"ok": False, "error": "PYTHON_TOO_OLD", "message": "需要 Python 3.9 或更高版本。"}, ensure_ascii=False), file=sys.stderr)
         return 2
     args = build_parser().parse_args()
+    if getattr(args, "bounded_output", False):
+        sys.stdout = sys.stderr = BoundedOutput(sys.stdout.buffer)
     script_file = Path(__file__).resolve()
     try:
         if args.command == "serve":
@@ -1864,19 +2084,21 @@ def main() -> int:
             return command_open(args, script_file)
         if args.command == "stop":
             return command_stop(args)
-        payload = health(args.port)
-        print(json.dumps(payload or {"ok": False, "error": "SERVER_UNAVAILABLE"}, ensure_ascii=False))
+        failures: list[str] = []
+        payload = health(args.port, failures=failures)
+        print(json.dumps(payload or {"ok": False, "error": "SERVER_UNAVAILABLE", "detail": failures}, ensure_ascii=False))
         return 0 if payload else 1
     except WorkbenchError as caught:
-        print(json.dumps({"ok": False, "error": caught.code, "message": str(caught)}, ensure_ascii=False), file=sys.stderr)
-        return 1
+        return report_cli_error(args.command, caught.code, caught, **caught.extra)
     except FileNotFoundError as caught:
-        print(json.dumps({"ok": False, "error": "FILE_NOT_FOUND", "message": str(caught)}, ensure_ascii=False), file=sys.stderr)
-        return 1
+        return report_cli_error(args.command, "FILE_NOT_FOUND", caught)
     except OSError as caught:
         code = "PORT_IN_USE" if getattr(caught, "errno", None) in {48, 98, 10048} else "SERVER_UNAVAILABLE"
-        print(json.dumps({"ok": False, "error": code, "message": str(caught)}, ensure_ascii=False), file=sys.stderr)
-        return 1
+        return report_cli_error(args.command, code, caught)
+    except Exception as caught:
+        if args.command != "serve":
+            raise
+        return report_cli_error(args.command, "SERVER_ERROR", caught)
 
 
 if __name__ == "__main__":

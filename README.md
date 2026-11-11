@@ -40,6 +40,8 @@ The plugin reuses a running local HTML Workbench service when one exists, or sta
 
 > **Development:** the plugin source lives in [`dsh-plugin/`](./dsh-plugin/). Build its distributable artifacts (client bundle, bundled Python service, frontend) with `node dsh-plugin/build.mjs`, or `cd dsh-plugin && npm run build`.
 
+For troubleshooting, click **HTML Workbench** at the top of the panel and select **复制排查提示词** (Copy troubleshooting prompt). Give it to an agent on the affected computer so it can collect the local logs and draft an issue for review. [Log locations and fallback prompt](./dsh-plugin/README.md#排查与反馈)
+
 ## What it solves
 
 - Avoid repeated chat-based requests such as “move this title down by 20 pixels.”

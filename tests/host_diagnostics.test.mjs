@@ -12,8 +12,9 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { readFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -103,6 +104,114 @@ test('a Python traceback reaches the diagnostics payload verbatim', quiet(async 
   const detail = diag.journal.map((entry) => entry.detail || '').join('\n')
   assert.ok(detail.includes("No module named 'http'"), 'the traceback must be readable in the journal')
 }))
+
+test('static host logs rotate and keep startup failures across plugin reloads', quiet(async () => {
+  const { apply } = await import('../dsh-plugin/src/index.js')
+  const runtimeDir = mkdtempSync(join(tmpdir(), 'hwb-host-test-'))
+  try {
+    const logFile = join(runtimeDir, 'logs', 'dsh-host-4950.log')
+    mkdirSync(dirname(logFile))
+    writeFileSync(logFile, 'x'.repeat(1024 * 1024))
+    const first = makeContext(dyingShell('Traceback: failed to import Python module'))
+    apply(first, { port: 4950, runtimeDir })
+    await new Promise(resolve => setImmediate(resolve))
+
+    const next = makeContext(healthyShell())
+    apply(next, { port: 4950, runtimeDir })
+    await new Promise(resolve => setImmediate(resolve))
+
+    const report = await callRoute(next, '/html-workbench/diagnostics')
+    assert.equal(report.hostLogFile, logFile)
+    assert.equal(report.hostLogError, null)
+    assert.ok(readFileSync(logFile + '.1').length >= 1024 * 1024)
+    const entries = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse)
+    assert.equal(entries.filter(entry => entry.message === '插件宿主已加载').length, 2)
+    assert.ok(entries.some(entry => entry.detail?.includes('Traceback: failed to import Python module')))
+  } finally {
+    rmSync(runtimeDir, { recursive: true, force: true })
+  }
+}))
+
+test('a missing host log leaves the journal and service usable', quiet(async () => {
+  const ctx = await boot(healthyShell(), { hostLog: {
+    file: '/unwritable/dsh-host.log',
+    append() { throw new Error('EACCES: log file denied') },
+  } })
+  const report = await callRoute(ctx, '/html-workbench/diagnostics')
+  assert.equal(report.running, true)
+  assert.match(report.hostLogError, /EACCES/)
+  assert.ok(report.journal.length > 0)
+}))
+
+test('repeated failures stay counted without flooding the host log', quiet(async () => {
+  const entries = []
+  const ctx = await boot(dyingShell('same failure'), {
+    hostLog: { file: 'host.log', append(entry) { entries.push(entry) } },
+  })
+  for (let i = 0; i < 10; i += 1) await callRoute(ctx, '/html-workbench/restart')
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+  const failures = entries.filter(entry => entry.message.includes('serve 进程已退出'))
+  assert.equal(failures.length, 1)
+  assert.ok(diag.journal.some(entry => entry.repeated >= 10))
+}))
+
+test('an owned live process refreshes its log-write failure status', async () => {
+  let started = false
+  let logError = null
+  const shell = healthyShell()
+  shell.run = async () => started
+    ? { exitCode: 0, stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench',
+      logging: { error: logError, droppedRecords: logError ? 3 : 0 } })) }
+    : { exitCode: 1 }
+  const start = shell.start
+  shell.start = () => { started = true; return start() }
+  const ctx = await boot(shell)
+  assert.equal((await callRoute(ctx, '/html-workbench/diagnostics')).owned, true)
+  logError = 'disk full'
+  const now = Date.now
+  Date.now = () => now() + 11000
+  try {
+    await callRoute(ctx, '/html-workbench/diagnostics')
+    await new Promise(resolve => setImmediate(resolve))
+    const report = await callRoute(ctx, '/html-workbench/diagnostics')
+    assert.equal(report.service.logging.error, 'disk full')
+    assert.equal(report.service.logging.droppedRecords, 3)
+  } finally {
+    Date.now = now
+  }
+})
+
+for (const platform of ['win32', 'linux', 'darwin']) {
+  test(platform + ' quotes configured Python paths with spaces and Unicode', async () => {
+    const commands = []
+    const shell = healthyShell()
+    const run = shell.run
+    shell.run = spec => spec.command.endsWith(' --version')
+      ? { exitCode: 0, stdout: collected('Python 3.12.0') } : run(spec)
+    shell.resolve = spec => { commands.push(spec.command); return spec }
+    const executable = platform === 'win32' ? 'C:\\测试 Tools\\Python\\python.exe' : '/tmp/测试 Tools/python3'
+    const ctx = await boot(shell, { platform, pythonCommand: executable })
+    assert.equal((await callRoute(ctx, '/html-workbench/diagnostics')).running, true)
+    assert.ok(commands.some(command => command.endsWith(' --version')))
+    assert.ok(commands.some(command => command.includes(' health --port ')))
+    assert.ok(commands.some(command => command.startsWith(
+      platform === 'win32' ? '"' + executable + '" ' : "'" + executable + "' ",
+    )))
+  })
+}
+
+test('Windows dynamic fallback uses its workspace when TEMP variables are absent', async () => {
+  const ctx = makeContext(healthyShell())
+  new Function('process', HOST_BODY)({
+    platform: 'win32', env: {}, version: 'test', arch: 'x64',
+    cwd: () => 'C:\\测试 Workspace',
+  }).apply(ctx, { script: 'C:/plugin/workbench.py', pythonCommand: 'python' })
+  await new Promise(resolve => setImmediate(resolve))
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+  assert.equal(diag.runtimeDir, 'C:\\测试 Workspace/.html-workbench')
+  const resolved = await callRoute(ctx, '/html-workbench/resolve?file=' + encodeURIComponent('file:///C:/测试%20Workspace/page.html'))
+  assert.equal(resolved.normalized, 'C:/测试 Workspace/page.html')
+})
 
 test("the CLI's structured error becomes the headline, raw line kept as detail", quiet(async () => {
   // This is the exact stderr line workbench.py emits when the port is taken.
@@ -815,4 +924,41 @@ test('a failed GrapesJS download is reported as a startup dependency issue', qui
   const result = await callRoute(ctx, '/html-workbench/dependencies')
   assert.equal(result.dependencyIssue.code, 'VENDOR_DOWNLOAD_FAILED')
   assert.match(result.dependencyIssue.message, /GrapesJS/)
+}))
+
+test('a health probe from before a restart cannot overwrite the new service state', quiet(async () => {
+  let running = false
+  let deferProbe = false
+  let finishProbe
+  const shell = healthyShell()
+  shell.run = async spec => {
+    if (spec.command.includes(' stop --port ')) { running = false; return { exitCode: 0 } }
+    if (deferProbe) {
+      deferProbe = false
+      return new Promise(resolve => { finishProbe = resolve })
+    }
+    return running ? { exitCode: 0, stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench' })) }
+      : { exitCode: 1 }
+  }
+  shell.start = () => {
+    running = true
+    return { status: 'running', readOutput: () => ({ delta: '' }), kill: () => { running = false } }
+  }
+  const ctx = await boot(shell)
+  const originalNow = Date.now
+  Date.now = () => originalNow() + 11000
+  try {
+    deferProbe = true
+    await callRoute(ctx, '/html-workbench/diagnostics')
+    assert.equal(typeof finishProbe, 'function')
+    const restarted = await callRoute(ctx, '/html-workbench/restart')
+    assert.equal(restarted.ok, true)
+    finishProbe({ exitCode: 1, stderr: collected('old service went away') })
+    await new Promise(resolve => setImmediate(resolve))
+    const report = await callRoute(ctx, '/html-workbench/diagnostics')
+    assert.equal(report.running, true)
+    assert.equal(report.startError, null)
+  } finally {
+    Date.now = originalNow
+  }
 }))

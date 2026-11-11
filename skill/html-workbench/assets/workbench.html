@@ -30,7 +30,7 @@ body { min-width: 0; overflow: hidden; background: var(--canvas); }
 button, input { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
 
-.workbench { position: relative; width: 100%; height: 100%; overflow: hidden; }
+.workbench { --tools-top: 62px; position: relative; width: 100%; height: 100%; overflow: hidden; }
 .topbar {
   position: absolute;
   z-index: 30;
@@ -56,7 +56,7 @@ button { -webkit-tap-highlight-color: transparent; }
   backdrop-filter: blur(18px) saturate(1.15);
   pointer-events: auto;
 }
-.file-cluster { position: relative; max-width: min(320px, 32vw); padding: 0; }
+.file-cluster { position: relative; z-index: 1; max-width: min(320px, 32vw); padding: 0; }
 .file-menu-button {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
@@ -162,7 +162,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .tool-rail {
   position: absolute;
   z-index: 28;
-  top: 64px;
+  top: calc(var(--tools-top) + 2px);
   left: 10px;
   display: grid;
   gap: 5px;
@@ -195,12 +195,12 @@ button { -webkit-tap-highlight-color: transparent; }
 .control-panel {
   position: absolute;
   z-index: 25;
-  top: 62px;
+  top: var(--tools-top);
   bottom: 12px;
   left: 60px;
   display: flex;
   flex-direction: column;
-  width: 288px;
+  width: min(288px, calc(100% - 72px));
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, .9);
   border-radius: 13px;
@@ -252,14 +252,14 @@ button { -webkit-tap-highlight-color: transparent; }
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 62px 12px 12px 58px;
+  padding: var(--tools-top) 12px 12px 58px;
   background: radial-gradient(circle at 52% 0%, rgba(255, 255, 255, .72), transparent 38%), var(--canvas);
   transition: padding-left .22s ease;
 }
 .workbench.panel-pinned .canvas-area { padding-left: 360px; }
 .workbench[data-mode="preview"] .tool-rail,
 .workbench[data-mode="preview"] .control-panel,
-.workbench[data-mode="preview"] .edit-action { display: none !important; }
+.workbench[data-mode="preview"] .actions { display: none !important; }
 .workbench[data-mode="preview"] .canvas-area { padding-left: 12px; }
 .workbench[data-mode="preview"] .canvas-viewport { box-shadow: 0 12px 38px rgba(38, 38, 35, .1); }
 .canvas-stage { display: flex; justify-content: center; width: max-content; min-width: 100%; height: 100%; min-height: 320px; }
@@ -301,6 +301,28 @@ button { -webkit-tap-highlight-color: transparent; }
   .toolbar-separator { margin-inline: 1px; }
   .actions #replace-image-button { display: none; }
   .context-toast { right: 10px; left: 10px; max-width: none; }
+  /* Keep a pinned inspector from pushing the whole canvas out of a sidebar. */
+  .workbench.panel-pinned .canvas-area { padding-left: 58px; }
+  .workbench.panel-pinned[data-mode="preview"] .canvas-area { padding-left: 12px; }
+  #pin-panel-button { display: none; }
+}
+
+/* Native DSH panes can be only 320px wide. Give the file/actions and the
+   viewport controls their own rows instead of shrinking the file to zero. */
+@media (max-width: 560px) {
+  .workbench { --tools-top: 112px; }
+  .topbar {
+    left: 10px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+  .file-cluster { grid-area: 1 / 1; width: 100%; max-width: none; }
+  .workbench[data-mode="preview"] .file-cluster { grid-column: 1 / -1; }
+  .actions { grid-area: 1 / 2; }
+  .viewport-controls { grid-area: 2 / 1 / 3 / 3; justify-self: center; }
+  .viewport-controls [data-width] { display: block; }
+  .file-popover { width: min(520px, calc(100vw - 20px)); z-index: 1; }
 }
 
 </style>
@@ -345,7 +367,7 @@ button { -webkit-tap-highlight-color: transparent; }
         <button id="replace-image-button" class="icon-button edit-action" type="button" aria-label="替换图片" title="替换图片">
           <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="2"/><circle cx="7" cy="8" r="1.2"/><path d="m5 14 3.5-3.5 2.5 2 2-2 2 2"/></svg>
         </button>
-        <button id="save-button" class="primary save-button edit-action" type="button">
+        <button id="save-button" class="primary save-button edit-action" type="button" aria-label="保存" title="保存">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 3h10l2 2v12H4z"/><path d="M7 3v5h6V3M7 17v-5h6v5"/></svg>
           <span>保存</span>
         </button>
@@ -471,6 +493,11 @@ function api(route) {
   return `${route}?file=${encodeURIComponent(activeFile)}`
 }
 
+function requestError(response, message) {
+  const id = response.headers.get('X-Workbench-Request-Id')
+  return new Error(id ? `${message}（请求编号 ${id}）` : message)
+}
+
 // The HTML/JS assets are re-read from disk on every request, but a long-lived
 // service keeps running the Python it was started with. So a new frontend can
 // meet an old API, whose missing routes answer 501 with an HTML error page.
@@ -482,9 +509,9 @@ async function readJson(response) {
     return JSON.parse(text)
   } catch (error) {
     if (response.status === 501 || response.status === 404) {
-      throw new Error('本地服务是旧版本，缺少该接口。请重启 Workbench 服务后重试。')
+      throw requestError(response, '本地服务是旧版本，缺少该接口。请重启 Workbench 服务后重试。')
     }
-    throw new Error(`服务返回了非 JSON 响应（HTTP ${response.status}）。`)
+    throw requestError(response, `服务返回了非 JSON 响应（HTTP ${response.status}）。`)
   }
 }
 
@@ -908,12 +935,13 @@ async function sendSelectionToChat(element) {
       body: JSON.stringify({ selections: [selection] }),
     })
     const packet = await readJson(response)
-    if (!response.ok) throw new Error(packet.message || packet.error)
+    if (!response.ok) throw requestError(response, packet.message || packet.error)
     publishContext(packet)
     flashContextElement(element)
     showContextToast(`已添加 ${packet.selections[0]?.selector || described.label} 到对话`)
     setStatus('已添加到对话上下文', 'saved')
   } catch (error) {
+    console.error('[html-workbench] context failed', error)
     showContextToast(error.message || '生成上下文失败，请重新选择。', 'error')
     setStatus('添加到对话失败', 'error')
   } finally {
@@ -1077,12 +1105,13 @@ async function save() {
       await applyDocument(result.document)
       return
     }
-    if (!response.ok) throw new Error(result.message || result.error)
+    if (!response.ok) throw requestError(response, result.message || result.error)
     revision = result.revision
     bodyScripts = result.bodyScripts || bodyScripts
     dirty = false
     setStatus('已与磁盘同步', 'saved')
   } catch (error) {
+    console.error('[html-workbench] save failed', error)
     setStatus(error.message || '保存失败', 'error')
   }
 }
@@ -1124,7 +1153,7 @@ async function loadFile(file = activeFile) {
     activeFile = file
     const response = await fetch(api('/api/document'))
     const document = await readJson(response)
-    if (!response.ok) throw new Error(document.message || document.error)
+    if (!response.ok) throw requestError(response, document.message || document.error)
     await applyDocument(document)
     dirty = false
     connectEvents()
@@ -1134,6 +1163,7 @@ async function loadFile(file = activeFile) {
     setFilePopover(false)
     setStatus('已与磁盘同步', 'saved')
   } catch (error) {
+    console.error('[html-workbench] load failed', error)
     setStatus(error.message || '加载失败', 'error')
   }
 }
@@ -1157,7 +1187,14 @@ function saveAttribute(name, input) {
   scheduleSave()
 }
 
-initEditor()
+try {
+  if (!grapesjs) throw new Error('GrapesJS 未加载。请检查浏览器网络记录和服务日志。')
+  initEditor()
+} catch (error) {
+  console.error('[html-workbench] editor initialization failed', error)
+  setStatus(error.message || '编辑器初始化失败', 'error')
+  throw error
+}
 document.querySelector('#open-button').addEventListener('click', () => loadFile(fileInput.value.trim()))
 fileInput.addEventListener('keydown', (event) => { if (event.key === 'Enter') loadFile(fileInput.value.trim()) })
 fileMenuButton.addEventListener('click', () => setFilePopover(filePopover.hidden))

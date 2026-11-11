@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -250,6 +251,25 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(response.read(), b"test-grapes.min.js")
             self.assertIn("immutable", response.headers["Cache-Control"])
 
+    def test_failed_request_can_be_correlated_without_logging_query_or_body(self):
+        query = urllib.parse.urlencode({"file": str(self.page), "marker": "private-query-marker"})
+        request = urllib.request.Request(self.base + f"/api/document?{query}", method="PUT", data=b"private-body-marker")
+        with self.assertLogs(workbench.get_logger()) as logs:
+            self.read_json("/api/health")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=2)
+        error = caught.exception
+        self.addCleanup(error.close)
+        request_id = error.headers["X-Workbench-Request-Id"]
+        self.assertEqual(error.code, 400)
+        self.assertRegex(request_id, r"^[a-f0-9]{12}$")
+        access = "\n".join(logs.output)
+        self.assertIn(f"http_request id={request_id} method=PUT route=/api/document status=400", access)
+        self.assertIn("code=INVALID_SAVE", access)
+        self.assertNotIn("/api/health", access)
+        self.assertNotIn("private-query-marker", access)
+        self.assertNotIn("private-body-marker", access)
+
 
 HEALTHY_PAYLOAD = {
     "service": workbench.SERVICE_NAME,
@@ -476,9 +496,13 @@ class FileReferenceTests(unittest.TestCase):
         self.assertEqual(log_dir, workbench.default_vendor_cache().parents[2] / "logs")
 
     def test_setup_logging_writes_rotating_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as cleanup:
             port = 4399
             logger, directory = workbench.setup_logging(tmp, port)
+            for handler in list(logger.handlers):
+                if isinstance(handler, workbench.RotatingFileHandler):
+                    cleanup.callback(handler.close)
+                    cleanup.callback(logger.removeHandler, handler)
             logger.info("hello %s", "world")
             # The resolved directory comes back so the host can report where the
             # log really is; asserting the file is INSIDE it states that contract
@@ -486,6 +510,22 @@ class FileReferenceTests(unittest.TestCase):
             log_file = directory / f"workbench-{port}.log"
             self.assertTrue(log_file.is_file(), f"log written to {directory}")
             self.assertIn("hello world", log_file.read_text(encoding="utf-8"))
+
+    def test_serve_failure_before_binding_is_logged_and_reports_the_log_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "serve", "--port", "4399",
+                 "--log-dir", tmp, "--asset", str(Path(tmp) / "missing.html")],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stderr)
+            log_file = Path(payload["logFile"])
+            self.assertEqual(log_file, Path(tmp) / "workbench-4399.log")
+            logs = log_file.read_text(encoding="utf-8")
+            self.assertIn("service_starting", logs)
+            self.assertIn("service_failed code=FILE_NOT_FOUND", logs)
+            self.assertIn("FileNotFoundError", logs)
 
     def test_setup_logging_survives_when_no_directory_is_writable(self):
         # The whole point of the fallback chain is that the service still binds
@@ -504,6 +544,62 @@ class FileReferenceTests(unittest.TestCase):
         logger.info("service continues without a file log")
 
 
+class BoundedLoggingTests(unittest.TestCase):
+    def test_health_preserves_probe_failure_reasons(self):
+        failures = []
+        with mock.patch.object(workbench.urllib.request, "urlopen", side_effect=TimeoutError("probe timed out")):
+            self.assertIsNone(workbench.health(4399, failures=failures))
+        self.assertEqual(failures, ["TimeoutError: probe timed out"])
+        for content in [b"[]", b"<html>other service</html>", b"x" * (64 * 1024 + 1)]:
+            with self.subTest(content=content[:20]), mock.patch.object(workbench.urllib.request, "urlopen") as request:
+                request.return_value.__enter__.return_value.read.return_value = content
+                failures = []
+                self.assertIsNone(workbench.health(4399, failures=failures))
+                self.assertTrue(failures)
+
+    def test_utf8_and_oversized_exceptions_stay_within_file_and_backup_limits(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(workbench.BoundedRotatingFileHandler(
+            Path(tmp) / "workbench.log", maxBytes=1024, backupCount=2, encoding="utf-8",
+        )) as handler:
+            logger = workbench.logging.Logger("bounded-test")
+            logger.addHandler(handler)
+            for _ in range(20):
+                try:
+                    raise ValueError("错误" * 4000 + "END-OF-ERROR")
+                except ValueError:
+                    logger.exception("BEGIN-OF-ERROR")
+            paths = list(Path(tmp).glob("workbench.log*"))
+            self.assertEqual(len(paths), 3)
+            for path in paths:
+                self.assertLessEqual(path.stat().st_size, 1024)
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("BEGIN-OF-ERROR", text)
+                self.assertIn("END-OF-ERROR", text)
+                self.assertIn("[truncated]", text)
+
+    def test_rotation_denied_by_windows_file_lock_backs_off_and_reports_loss(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(workbench.BoundedRotatingFileHandler(
+            Path(tmp) / "workbench.log", maxBytes=256, backupCount=2, encoding="utf-8",
+        )) as handler:
+            logger = workbench.logging.Logger("locked-test")
+            logger.addHandler(handler)
+            logger.error("x" * 240)
+            before = Path(handler.baseFilename).stat().st_size
+            with mock.patch.object(handler, "doRollover", side_effect=PermissionError("WinError 32 file in use")) as rotate, \
+                 mock.patch.object(workbench, "_logger", logger), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                for _ in range(100):
+                    logger.error("x" * 240)
+                self.assertEqual(rotate.call_count, 1)
+                status = workbench.logging_status()
+                self.assertEqual(status["droppedRecords"], 100)
+                self.assertIn("WinError 32", status["error"])
+                self.assertEqual(stderr.getvalue().count("log_write_failed"), 1)
+                self.assertEqual(Path(handler.baseFilename).stat().st_size, before)
+                handler.retry_at = 0
+            logger.error("recovered")
+            self.assertIsNone(handler.last_error)
+
+
 class DetachedStartTests(unittest.TestCase):
     """`open` spawns `serve`; an uncapturable console must not block the spawn."""
 
@@ -512,7 +608,7 @@ class DetachedStartTests(unittest.TestCase):
 
         def fake_popen(command, **kwargs):
             spawned["command"] = command
-            spawned["stdout"] = kwargs.get("stdout")
+            spawned.update(kwargs)
             return mock.Mock(pid=4242)
 
         with mock.patch.object(workbench.subprocess, "Popen", fake_popen):
@@ -530,6 +626,61 @@ class DetachedStartTests(unittest.TestCase):
         self.assertIsNotNone(log_file)
         self.assertEqual(log_file.name, "html-workbench-4399.log")
         self.assertIn("--log-dir", spawned["command"])
+        self.assertIn("--bounded-output", spawned["command"])
+
+    def test_relaunch_bounds_historical_output_and_retains_previous_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs"
+            logs.mkdir()
+            output = logs / "html-workbench-4399.log"
+            output.write_bytes(("错误" * workbench.BOOTSTRAP_MAX_BYTES).encode("utf-8") + b"previous failure")
+            self.spawn(tmp)
+            self.assertEqual(output.stat().st_size, 0)
+            previous = logs / "html-workbench-4399.log.1"
+            self.assertLessEqual(previous.stat().st_size, workbench.BOOTSTRAP_MAX_BYTES)
+            self.assertTrue(previous.read_bytes().endswith(b"previous failure"))
+            previous.read_bytes().decode("utf-8")
+
+    def test_bounded_child_reports_unicode_startup_failure_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "bootstrap.log"
+            with output.open("wb") as stream:
+                result = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), "serve", "--bounded-output", "--port", "4399",
+                     "--log-dir", tmp, "--asset", str(Path(tmp) / "中文 路径.html")],
+                    stdout=stream, stderr=subprocess.STDOUT, timeout=10,
+                )
+            self.assertEqual(result.returncode, 1)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["error"], "FILE_NOT_FOUND")
+            self.assertIn("中文 路径.html", report["message"])
+            self.assertLessEqual(output.stat().st_size, workbench.BOOTSTRAP_MAX_BYTES)
+
+    def test_windows_detached_flags_remain_compatible_with_output_capture(self):
+        windows_os = SimpleNamespace(**{**vars(workbench.os), "name": "nt"})
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(workbench, "os", windows_os), \
+             mock.patch.object(workbench.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, create=True), \
+             mock.patch.object(workbench.subprocess, "DETACHED_PROCESS", 8, create=True):
+            _, _, spawned = self.spawn(tmp)
+            self.assertEqual(spawned["creationflags"], 520)
+            self.assertNotIn("start_new_session", spawned)
+            self.assertIn("--bounded-output", spawned["command"])
+
+    def test_combined_output_is_utf8_and_stops_at_its_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "bootstrap.log"
+            with output.open("wb") as raw:
+                stream = workbench.BoundedOutput(raw)
+                stream.write("中文 Windows 路径\n")
+                stream.write("错误" * workbench.BOOTSTRAP_MAX_BYTES)
+                for _ in range(100):
+                    stream.write("further output")
+                self.assertLessEqual(output.stat().st_size, workbench.BOOTSTRAP_MAX_BYTES)
+                text = output.read_bytes().decode("utf-8")
+                self.assertIn("中文 Windows 路径", text)
+                self.assertIn("[bootstrap output limit reached]", text)
+                self.assertNotIn("further output", text)
 
     def test_starts_without_a_log_when_the_file_cannot_be_opened(self):
         with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
@@ -616,6 +767,18 @@ class WritableDirectoryTests(unittest.TestCase):
         candidates = workbench.log_candidates("/requested/logs")
         self.assertEqual(candidates[0], Path("/requested/logs"))
         self.assertEqual(candidates[1], workbench.runtime_directory() / "logs")
+
+    def test_denied_system_temp_does_not_block_explicit_log_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as cleanup:
+            with mock.patch.object(workbench.tempfile, "gettempdir", side_effect=PermissionError("TEMP denied")):
+                logger, directory = workbench.setup_logging(tmp, 4399)
+            for handler in list(logger.handlers):
+                if isinstance(handler, workbench.RotatingFileHandler):
+                    cleanup.callback(handler.close)
+                    cleanup.callback(logger.removeHandler, handler)
+            self.assertEqual(directory, Path(tmp))
+            logger.info("workspace still writable")
+            self.assertIn("workspace still writable", (directory / "workbench-4399.log").read_text(encoding="utf-8"))
 
     def test_vendor_cache_follows_the_log_directory_that_won(self):
         candidates = workbench.vendor_candidates("/requested/vendor", Path("/granted") / workbench.RUNTIME_DIR_NAME / "logs")
