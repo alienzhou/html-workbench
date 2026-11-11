@@ -22,18 +22,18 @@ HTML Workbench 同时也是 [DeepSeek Harness](https://github.com/deepseek-ai/De
 
 ### 安装
 
-前置：已装好 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) 且 `dsh web` 能正常运行，Node.js ≥ 20，Python 3.9+。
+请先安装 [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness)、pnpm 和 Python 3.9+。Node.js 版本按 DSH 的要求选择，例如 DSH `0.2.2-rc.1` 需要 Node.js 24.9.0 或更新版本。
 
 ```bash
-dsh plugin --profile web add @vibe-x/dsh-html-workbench
+dsh plugin --profile web add -w @vibe-x/dsh-html-workbench
 ```
 
-装完重启 `dsh web` 并硬刷新浏览器（Cmd/Ctrl+Shift+R），Web 界面右上角会出现触发按钮。
+装完后重启 `dsh web` 并刷新浏览器。如果安装的是 `0.3.1`，且诊断显示 `shell.start is not a function`，可以[从源码打包安装](./dsh-plugin/README.md#从源码构建和安装)。
 
 ### 使用
 
 1. 让 Agent 在工作区创建或修改一个 `.html` 文件，插件会自动捕获它。
-2. 点击右上角触发按钮打开面板，选择文件后即在内嵌编辑器中载入。
+2. 在右侧栏的「新标签页」菜单里打开 **HTML Workbench**，再选择文件。没有侧栏注册服务的 profile 可以通过右上角的 HTML Workbench 按钮打开浮窗。
 3. 在**编辑**模式下调整，在**预览**模式验证交互，最后**保存**写回原文件。
 
 插件会复用本机已运行的 HTML Workbench 服务，没有则自动后台拉起一个；插件卸载时再停掉它自己启动的那个进程。全程只跑在 `127.0.0.1`。

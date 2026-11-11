@@ -1,6 +1,6 @@
 {
   "name": "@vibe-x/dsh-html-workbench",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "DeepSeek Harness 插件：在右侧栏预览并可视化编辑 agent 生成的 HTML（复用/拉起本地 html-workbench 服务）。",
   "license": "MIT",
   "type": "module",

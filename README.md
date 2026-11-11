@@ -22,18 +22,18 @@ As the agent creates or edits `.html` files (through the `write` / `edit` tools)
 
 ### Install
 
-Prerequisites: [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) installed and `dsh web` running, Node.js ≥ 20, and Python 3.9+.
+Install [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness), pnpm, and Python 3.9+. Use the Node.js version required by your DSH release. For DSH `0.2.2-rc.1`, use Node.js 24.9.0 or newer.
 
 ```bash
-dsh plugin --profile web add @vibe-x/dsh-html-workbench
+dsh plugin --profile web add -w @vibe-x/dsh-html-workbench
 ```
 
-Restart `dsh web` and hard-refresh the browser (Cmd/Ctrl+Shift+R). A trigger button appears in the top-right of the web UI.
+Restart `dsh web` and refresh the browser. If the installed version is `0.3.1` and the diagnostics show `shell.start is not a function`, [install a package built from source](./dsh-plugin/README.md#从源码构建和安装).
 
 ### Use
 
 1. Ask the agent to create or edit an `.html` file in the workspace. The plugin picks it up automatically.
-2. Click the top-right trigger to open the panel and choose a file; it loads in the embedded editor.
+2. Open **HTML Workbench** from the right sidebar's **New tab** menu and choose a file. On profiles without a sidebar registry, use the top-right HTML Workbench button.
 3. Edit in **Edit** mode, verify interactions in **Preview**, then **Save** to write back to the original file.
 
 The plugin reuses a running local HTML Workbench service when one exists, or starts one in the background — and stops the process it started when the plugin unloads. Everything stays on `127.0.0.1`.

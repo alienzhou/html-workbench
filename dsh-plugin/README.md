@@ -2,7 +2,7 @@
 
 在 DeepSeek Harness（DSH）的右侧栏预览并可视化编辑 agent 生成的 HTML 文件。它复用（或拉起）HTML Workbench 的本地 Python 服务，把 GrapesJS 编辑器内嵌到页面 iframe 里，直接改文案/样式/图片、切 Preview 验证交互、Save 写回磁盘。
 
-> 只托管源码，不做编译/打包。插件通过 `shell` 服务拉起仓库里**已生成**的 runnable workbench（`skill/html-workbench/scripts/workbench.py`，由根目录 `npm run build` 从 `service/` 生成）。
+插件通过 DSH 的 `shell` 服务启动本地编辑器。动态加载时使用仓库里的 `skill/html-workbench/scripts/workbench.py`，npm 安装时使用包内的 `scripts/workbench.py`。
 
 ## 面板席位
 
@@ -44,9 +44,21 @@ dsh-plugin/
 
 `cordis.patch.yml` + `package.json` 的 `dsh.bundle` 把插件作为一层 profile 装载；Client 半由 `npm run build` 打成 `lib/client.js`（`window.__ModuleLoader__.load`）。`prepublishOnly` 会自动构建，所以 `lib/`、`scripts/`、`assets/` 是构建产物、不入库。
 
+### 从源码构建和安装
+
+npm 上发布的 `0.3.1` 调用了 DSH 公开版本未提供的 `shell.start()`。仓库主干已经支持公开的 `shell.resolve()` 和 `shell.execute()`。从仓库根目录执行以下命令，可以将带修复的本地包安装到 Web profile：
+
+```sh
+node dsh-plugin/build.mjs
+npm pack ./dsh-plugin
+dsh plugin --profile web add -w ./vibe-x-dsh-html-workbench-0.3.2.tgz
+```
+
+`-w` 由 pnpm 处理，允许将依赖添加到 Web profile 的 workspace 根目录。装完后重启 `dsh web`，并在右侧栏的「新标签页」中打开 **HTML Workbench**。
+
 ## 服务生命周期（副作用管理）
 
-- **注册时**：`apply` 里异步 `startService()`，先 `health` 探测 `4317`；已在运行则复用（不认领），否则 `shell.start` 后台拉起 `workbench.py serve`。
+- **注册时**：`apply` 里异步调用 `startService()`。插件先探测 `4317` 上的服务，健康时直接复用，否则通过 ShellExecutor 启动 `workbench.py serve`。
 - **卸载时**：`ctx.effect` 的 disposer `kill()` 掉本插件自己启动的那个进程；复用的服务不误杀。
 
 ## 运行时目录（Windows 沙箱）

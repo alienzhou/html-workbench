@@ -1,6 +1,6 @@
 {
   "id": "@vibe-x/dsh-html-workbench",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "main": "./src/index.js",
   "description": "在 DeepSeek Harness 右侧栏预览并可视化编辑 agent 生成的 HTML：复用/拉起本地 html-workbench 服务，在 iframe 中内嵌 GrapesJS 编辑器，插件卸载时停掉自己启动的服务。",
   "engines": {
