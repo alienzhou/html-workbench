@@ -1,0 +1,21 @@
+dsh-plugin/src/host.js
+  s_e37463a0f3ee1d::t_58ca0cabb8828b 91-92,306,313,392,396,409,420,422,425-427,449-450,452,454-457,468-472,480,587-588,601-603,622-626,809
+tests/host_diagnostics.test.mjs
+  s_e37463a0f3ee1d::t_a14800d5ccbe1a 411,418,432,721-778
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a434ad2bf85c834e4199e17455d5fc6da2b43807",
+  "prompts": {},
+  "sessions": {
+    "s_e37463a0f3ee1d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1cb44-4bf0-79a0-9d97-d2af18fbf8ae",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "周鸿轩 <zhouhongxuan@BakMacBook-Pro.local>"
+    }
+  }
+}
