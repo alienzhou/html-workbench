@@ -33,7 +33,6 @@ const makeContext = (shell) => {
     get: (name) => (name === 'shell' ? shell : name === 'webServer' ? webServer : undefined),
     on: () => {},
     effect: (fn) => fn(),
-    // Collapse the poll interval so a 240-iteration wait cannot slow the suite.
     timeout: (ms) => new Promise((done) => setTimeout(done, Math.min(ms, 1))),
     interval: () => () => {},
   }
@@ -409,14 +408,14 @@ test('a Windows path with spaces stays intact through the existence probe', asyn
   assert.ok(probe.includes('"' + target + '"'), 'the path must arrive verbatim, quoted for spaces')
 })
 
-test('a trailing backslash cannot escape its own closing quote', async () => {
+test('a trailing backslash cannot escape its own closing quote', quiet(async () => {
   const commands = []
   const shell = {
     resolve: (spec) => (commands.push(spec.command), spec),
     run: async (spec) => (spec.command.endsWith('--version')
       ? { exitCode: 0, stdout: collected('Python 3.12.0'), stderr: collected('') }
       : { exitCode: 1, stdout: collected(''), stderr: collected('') }),
-    start: () => ({ status: 'running', exitCode: null, signal: null, readOutput: () => ({ delta: '' }), kill: () => true }),
+    start: () => dyingShell('').start(),
   }
   // `%TEMP%` values legitimately end in a separator; `"C:\dir\"` would escape the
   // quote and merge the next argument into the path.
@@ -430,7 +429,7 @@ test('a trailing backslash cannot escape its own closing quote', async () => {
   assert.ok(serve.includes('--log-dir "C:\\Temp\\hwb/logs"'), 'a quoted path must stay one argument')
   assert.ok(!serve.includes('\\/'), 'a trailing separator must not survive concatenation')
   assert.ok(!/[^\\]\\"/.test(serve), 'no closing quote may be left escaped by a backslash')
-})
+}))
 
 test('a POSIX path with a quote is escaped, not injected', async () => {
   const commands = []
@@ -718,4 +717,62 @@ test('a serve process that dies at once is reported on a public kernel, not poll
   assert.match(diag.startError, /端口已被占用/)
   assert.match(diag.startError, /PORT_IN_USE/)
   assert.ok(Date.now() - started < 2000, 'a dead process must not look like a hang')
+}))
+
+test('opening multiple files while the public executor is starting shares one process', async () => {
+  let releaseSpawn
+  const spawnGate = new Promise((resolve) => { releaseSpawn = resolve })
+  let starts = 0
+  let healthy = false
+  const shell = publicShell({
+    serve: async () => {
+      starts += 1
+      await spawnGate
+      healthy = true
+      return { status: 'running', readOutput: () => ({ delta: '' }), kill: () => true }
+    },
+    foreground: () => ({
+      exitCode: healthy ? 0 : 1,
+      stdout: collected(healthy ? JSON.stringify({ ok: true, service: 'html-workbench' }) : ''),
+    }),
+  })
+  const ctx = makeContext(shell)
+  loadPlugin().apply(ctx, { script: '/tmp/fake/workbench.py' })
+  await new Promise(setImmediate)
+
+  const first = callRoute(ctx, '/html-workbench/open?file=%2Ftmp%2Ffirst.html')
+  const second = callRoute(ctx, '/html-workbench/open?file=%2Ftmp%2Fsecond.html')
+  await new Promise(setImmediate)
+  releaseSpawn()
+
+  const results = await Promise.all([first, second])
+  assert.equal(starts, 1)
+  assert.deepEqual(results.map(({ url }) => new URL(url).searchParams.get('file')), ['/tmp/first.html', '/tmp/second.html'])
+  assert.equal((await callRoute(ctx, '/html-workbench/diagnostics')).owned, true)
+})
+
+test('a public executor process that never becomes healthy is stopped at the startup deadline', quiet(async () => {
+  let stopped = 0
+  const shell = publicShell({
+    serve: () => ({
+      status: 'running',
+      readOutput: () => ({ delta: '' }),
+      kill: () => { stopped += 1; return true },
+    }),
+  })
+  const ctx = makeContext(shell)
+  const originalNow = Date.now
+  let now = originalNow()
+  Date.now = () => now
+  ctx.timeout = async (ms) => { now += ms }
+  try {
+    loadPlugin().apply(ctx, { script: '/tmp/fake/workbench.py' })
+    const result = await callRoute(ctx, '/html-workbench/open?file=%2Ftmp%2Fpage.html')
+    assert.equal(result.ok, false)
+    assert.match(result.error, /60 秒内没有就绪/)
+    assert.equal(stopped, 1)
+    assert.equal(result.diagnostics.owned, false)
+  } finally {
+    Date.now = originalNow
+  }
 }))

@@ -88,6 +88,8 @@ return {
     let pythonProbeFailedAt = 0
     let pythonProbe = null
     let disposed = false
+    let starting = null
+    let restarting = null
 
     const shell = ctx.get('shell')
 
@@ -301,14 +303,14 @@ return {
 
     // `health` runs on a timer, so its failures are expected and must not flood
     // the journal — poll quietly and let the caller decide what is worth noting.
-    const probeHealth = async () => {
+    const probeHealth = async (timeoutMs = 8000) => {
       if (!shell || !SCRIPT) return null
       const python = await resolvePythonCommand()
       if (!python) return null
       try {
         const spec = shell.resolve({
           command: python + ' ' + quoteArg(SCRIPT) + ' health --port ' + PORT,
-          timeoutMs: 8000,
+          timeoutMs: timeoutMs,
           stdoutMaxBytes: 64 * 1024,
         })
         const result = await runShell(spec)
@@ -387,10 +389,11 @@ return {
       }
     }
 
-    const startService = async () => {
+    const startOrReuseService = async () => {
       if (disposed) return null
       if (serviceRunning) return health()
       const existing = await health()
+      if (disposed) return null
       if (existing) {
         serviceRunning = true
         startError = null
@@ -403,7 +406,7 @@ return {
       if (!shell) { startError = 'shell 服务不可用（DSH 未提供 shell，插件无法拉起本地服务）'; note('error', startError); return null }
       if (!SCRIPT) { startError = 'workbench.py 路径未配置（请用静态装载并随包分发 scripts/workbench.py）'; note('error', startError); return null }
       const python = await resolvePythonCommand()
-      if (!python) return null
+      if (disposed || !python) return null
       let proc = null
       const command = python + ' ' + quoteArg(SCRIPT) + ' serve --port ' + PORT
         + ' --log-dir ' + quoteArg(LOG_DIR)
@@ -414,12 +417,14 @@ return {
         proc = await startShell(shell.resolve({ command: command, stdoutMaxBytes: 64 * 1024 }))
         if (disposed) { try { proc.kill() } catch (e) {} return null }
         ownedProcess = proc
+        const deadline = Date.now() + 60000
         let transcript = ''
-        for (let i = 0; i < 240; i += 1) {
+        while (!disposed && Date.now() < deadline) {
           const chunk = drain(proc)
           if (chunk) transcript += (transcript ? '\n' : '') + chunk
-          const probe = await probeHealth()
-          if (probe && probe.ok) {
+          const probe = await probeHealth(Math.max(1, Math.min(8000, deadline - Date.now())))
+          if (disposed) return null
+          if (probe && probe.ok && proc.status === 'running') {
             serviceRunning = true
             startError = null
             healthConfirmedAt = Date.now()
@@ -441,10 +446,15 @@ return {
             ownedProcess = null
             return null
           }
-          await ctx.timeout(250)
+          const remaining = deadline - Date.now()
+          if (remaining > 0) await ctx.timeout(Math.min(250, remaining))
         }
+        if (disposed) return null
         startError = '服务在 60 秒内没有就绪（端口 ' + PORT + ' 未通过健康检查）'
-        note('error', startError, transcript || '进程仍在运行但健康检查一直失败。命令：' + command)
+        note('error', startError, transcript || '健康检查一直失败。命令：' + command)
+        // The public executor leaves serve running until we stop it.
+        proc.kill()
+        ownedProcess = null
         return null
       } catch (e) {
         startError = 'serve 进程启动失败：' + ((e && e.message) || String(e))
@@ -455,6 +465,11 @@ return {
       }
     }
 
+    const startService = () => {
+      if (!starting) starting = startOrReuseService().finally(() => { starting = null })
+      return starting
+    }
+
     // A service that dies AFTER a successful start used to leave the plugin
     // frozen: nothing ever re-checked the process, so the panel kept showing a
     // stale dot while every open failed with no explanation. Reading
@@ -462,7 +477,7 @@ return {
     // existing poll can supervise the process for free.
     const superviseOwnedProcess = () => {
       const proc = ownedProcess
-      if (!proc || proc.status === 'running') return
+      if (starting || !proc || proc.status === 'running') return
       const tail = drain(proc)
       const explained = explainOutput(tail)
       ownedProcess = null
@@ -569,9 +584,8 @@ return {
       if (typeof file !== 'string' || !file) return { ok: false, error: '请填写文件路径' }
       if (!/\.html?$/i.test(file)) return { ok: false, error: '只支持 .html / .htm 文件' }
       if (!SCRIPT) return { ok: false, error: startError || 'workbench.py 路径未配置', diagnostics: diagnostics() }
-      const wasUp = await health()
-      if (!wasUp) await startService()
-      const h = await health()
+      const wasUp = !starting && !restarting ? await health() : null
+      const h = restarting ? (await restarting).info : wasUp || await startService()
       // Carry the diagnostics WITH the failure: the panel can then show the real
       // cause instead of a generic "unavailable" that sends the user hunting.
       if (!h) return { ok: false, error: startError || '本地服务未就绪', diagnostics: diagnostics() }
@@ -584,7 +598,9 @@ return {
       }
     }
 
-    const restartService = async () => {
+    const stopAndRestartService = async () => {
+      await starting
+      if (disposed) return { ok: false, error: 'HTML Workbench 已卸载' }
       const proc = ownedProcess
       ownedProcess = null
       serviceRunning = false
@@ -601,6 +617,11 @@ return {
       }
       const h = await startService()
       return h ? { ok: true, info: h, diagnostics: diagnostics() } : { ok: false, error: startError || '重启失败', diagnostics: diagnostics() }
+    }
+
+    const restartService = () => {
+      if (!restarting) restarting = stopAndRestartService().finally(() => { restarting = null })
+      return restarting
     }
 
     // Browser address bars yield file:///… URLs while the CLI expects a native
@@ -785,7 +806,7 @@ return {
     // A rejection here must not escape into Cordis: `apply` has already wired up
     // the transports, and losing them would take the diagnostics route down with
     // it — leaving the panel with nothing but "Failed to fetch" again.
-    Promise.resolve().then(startService).catch((error) => {
+    Promise.resolve().then(() => restarting ? null : startService()).catch((error) => {
       startError = '启动本地服务时发生未预期的错误：' + ((error && error.message) || String(error))
       note('error', startError, (error && error.stack) || null)
     })
