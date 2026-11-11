@@ -4,6 +4,14 @@
 
 插件通过 DSH 的 `shell` 服务启动本地编辑器。动态加载时使用仓库里的 `skill/html-workbench/scripts/workbench.py`，npm 安装时使用包内的 `scripts/workbench.py`。
 
+## 环境依赖
+
+- 安装插件前先装好 DSH 和 pnpm，并使用该 DSH 版本要求的 Node.js。可用 `dsh --version`、`node --version` 和 `pnpm --version` 检查。
+- 运行编辑服务需要 Python 3.9 或更高版本。插件从运行 DSH 的环境查找 `python3` 或 `python`，Windows 还会尝试 `py` 启动器。服务使用 Python 标准库，无需用 pip 安装依赖。
+- 如果本机没有通过校验的 GrapesJS 缓存，首次启动需要联网下载，并将文件写入本地缓存。之后可以离线使用已缓存的版本。
+
+打开 DSH Web 页面时，如果插件找不到可用的 Python、发现 Python 版本太低，或启动时确认编辑器资源缺失，页面会显示原因和处理方法。Python 安装或升级完成后，请在新终端确认 `python3 --version` 或 `python --version`，然后重启 DSH。
+
 ## 面板席位
 
 面板优先使用 profile 提供的侧栏，入口在右侧栏的「新标签页」列表：

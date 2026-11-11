@@ -41,7 +41,7 @@ return {
     // the interpreter's absolute path and uses that instead.
     const PYTHON_CANDIDATES = opts.pythonCommand
       ? [opts.pythonCommand]
-      : (IS_WINDOWS ? ['python3', 'python'] : ['python3'])
+      : ['python3', 'python']
     // Static packages inject the runtime directory resolved (and probed) by
     // src/index.js. Keep a dynamic-loader fallback too: TEMP/TMPDIR cover
     // Windows/macOS/Linux; only the final fallback is POSIX because dynamic
@@ -79,7 +79,8 @@ return {
     let ownedProcess = null
     let serviceRunning = false
     let startError = null
-    let pythonCommand = opts.pythonCommand || (IS_WINDOWS ? null : 'python3')
+    let pythonCommand = null
+    let dependencyIssue = null
     // A failed probe must be remembered: `resolve` runs on every keystroke and
     // `health` on a timer, so re-probing would spawn three 5s subprocesses per
     // call and flood the journal with one repeated line. The TTL still lets a
@@ -245,33 +246,41 @@ return {
       if (pythonProbeFailedAt && Date.now() - pythonProbeFailedAt < PROBE_RETRY_MS) return null
       pythonProbe = (async () => {
         const failures = []
-        for (const candidate of PYTHON_CANDIDATES) {
+        const unsupported = []
+        const checkVersion = async (command) => {
           try {
-            const spec = shell.resolve({ command: candidate + ' --version', timeoutMs: 5000, stdoutMaxBytes: 4096 })
+            const spec = shell.resolve({ command: command + ' --version', timeoutMs: 5000, stdoutMaxBytes: 4096 })
             const result = await runShell(spec)
             if (result && result.exitCode === 0) {
-              pythonCommand = candidate
-              pythonProbeFailedAt = 0
-              note('info', '使用 Python 解释器：' + candidate)
-              return pythonCommand
+              const output = outputText(result.stdout) + '\n' + outputText(result.stderr)
+              const version = /\bPython (\d+)\.(\d+)(?:\.\d+)?/.exec(output)
+              if (version && (Number(version[1]) > 3 || (version[1] === '3' && Number(version[2]) >= 9))) {
+                pythonCommand = command
+                pythonProbeFailedAt = 0
+                if (dependencyIssue?.code.startsWith('PYTHON_')) dependencyIssue = null
+                note('info', '使用 Python 解释器：' + command + '（' + version[0] + '）')
+                return true
+              }
+              if (version) unsupported.push(version[0])
             }
-            failures.push(candidate + ': ' + describeRun(result))
+            failures.push(command + ': ' + describeRun(result))
           } catch (e) {
-            failures.push(candidate + ': ' + ((e && e.message) || String(e)))
+            failures.push(command + ': ' + ((e && e.message) || String(e)))
           }
+          return false
+        }
+        for (const candidate of PYTHON_CANDIDATES) {
+          const command = opts.pythonCommand ? quoteArg(candidate) : candidate
+          if (await checkVersion(command)) return pythonCommand
         }
         const launcher = await expandWindowsLauncher()
-        if (launcher && launcher.command) {
-          pythonCommand = launcher.command
-          pythonProbeFailedAt = 0
-          note('info', '使用 Python 解释器（经 py 启动器解析）：' + launcher.command)
-          return pythonCommand
-        }
+        if (launcher?.command && await checkVersion(launcher.command)) return pythonCommand
         if (launcher && launcher.failure) failures.push(launcher.failure)
         pythonProbeFailedAt = Date.now()
-        startError = '找不到可用的 Python 3 解释器（已尝试：'
-          + PYTHON_CANDIDATES.join('、') + (IS_WINDOWS ? '、py -3' : '')
-          + '）。请安装 Python 3.9+ 并确保它在 PATH 中，然后点「重启服务」。'
+        const versions = [...new Set(unsupported)].join('、')
+        startError = versions ? '检测到 ' + versions + '，版本过低。' : '找不到可用的 Python 3 解释器。'
+        startError += ' 请在运行 DSH 的电脑上安装 Python 3.9 或更高版本，确认 Python 已加入 PATH，然后重启 DSH。'
+        dependencyIssue = { code: versions ? 'PYTHON_TOO_OLD' : 'PYTHON_UNAVAILABLE', message: startError }
         note('error', startError, failures.join('\n'))
         return null
       })()
@@ -350,14 +359,14 @@ return {
     // in the detail so nothing is lost when the code is one we do not know.
     const CLI_HINTS = {
       PORT_IN_USE: '端口已被占用。可能有别的进程（或旧版服务）占着它 —— 点「重启服务」会先退役占用者。',
-      ASSET_NOT_FOUND: '前端资源缺失，插件安装目录不完整（缺 assets/workbench.html）。',
+      ASSET_NOT_FOUND: '缺少编辑器文件 assets/workbench.html。请重新安装 HTML Workbench 插件，然后重启 DSH。',
       PYTHON_TOO_OLD: '需要 Python 3.9 或更高版本。',
       SERVER_OUTDATED: '端口上有旧版服务且无法自动停止，请手动结束该进程。',
       FILE_NOT_FOUND: '找不到文件。',
-      VENDOR_DOWNLOAD_FAILED: '首次启动需要联网下载 GrapesJS，下载失败了。',
+      VENDOR_DOWNLOAD_FAILED: '无法准备编辑器所需的 GrapesJS。请检查运行 DSH 的电脑能否联网，以及缓存目录是否可写，然后在工作台中重启服务。',
     }
 
-    const explainOutput = (text) => {
+    const explainOutput = (text, startup = false) => {
       if (!text) return null
       for (const line of String(text).split('\n')) {
         const trimmed = line.trim()
@@ -366,7 +375,11 @@ return {
           const payload = JSON.parse(trimmed)
           if (payload && payload.ok === false && payload.error) {
             const hint = CLI_HINTS[payload.error]
-            return (hint || payload.message || payload.error) + '（' + payload.error + '）'
+            const message = hint || payload.message || payload.error
+            if (startup && ['VENDOR_DOWNLOAD_FAILED', 'ASSET_NOT_FOUND'].includes(payload.error)) {
+              dependencyIssue = { code: payload.error, message }
+            }
+            return message + '（' + payload.error + '）'
           }
         } catch (e) { /* not the JSON line; keep scanning */ }
       }
@@ -397,6 +410,7 @@ return {
       if (existing) {
         serviceRunning = true
         startError = null
+        dependencyIssue = null
         healthConfirmedAt = Date.now()
         // Record the reuse too, so the journal always explains the CURRENT state
         // rather than only the failures.
@@ -427,6 +441,7 @@ return {
           if (probe && probe.ok && proc.status === 'running') {
             serviceRunning = true
             startError = null
+            dependencyIssue = null
             healthConfirmedAt = Date.now()
             adoptResolvedPaths(probe.payload)
             note('info', '本地服务就绪：版本 ' + (probe.payload.version || '未知') + '，端口 ' + PORT)
@@ -440,7 +455,7 @@ return {
             if (tail) transcript += (transcript ? '\n' : '') + tail
             // Lead with the CLI's own diagnosis when it gave one — "端口已被占用"
             // is actionable, "exit=1" is not.
-            const explained = explainOutput(transcript)
+            const explained = explainOutput(transcript, true)
             startError = explained || ('serve 进程已退出（exit=' + String(proc.exitCode) + (proc.signal ? ', 信号 ' + proc.signal : '') + '）')
             note('error', startError, transcript || '进程没有任何输出。命令：' + command)
             ownedProcess = null
@@ -539,6 +554,7 @@ return {
         processStatus: ownedProcess ? ownedProcess.status : null,
         exitCode: ownedProcess ? ownedProcess.exitCode : null,
         startError: startError,
+        dependencyIssue,
         journal: journal.slice().reverse(),
       }
     }
@@ -605,6 +621,8 @@ return {
       ownedProcess = null
       serviceRunning = false
       startError = null
+      if (dependencyIssue?.code.startsWith('PYTHON_')) pythonProbeFailedAt = 0
+      dependencyIssue = null
       if (proc) { try { proc.kill() } catch (e) {} }
       note('info', '手动重启本地服务')
       // Killing our own handle is not enough when the port is held by a process
@@ -622,6 +640,13 @@ return {
     const restartService = () => {
       if (!restarting) restarting = stopAndRestartService().finally(() => { restarting = null })
       return restarting
+    }
+
+    const dependencyPayload = async () => {
+      const pending = restarting || starting
+      if (pending) await pending
+      else if (!serviceRunning && !startError) await startService()
+      return { ok: true, dependencyIssue }
     }
 
     // Browser address bars yield file:///… URLs while the CLI expects a native
@@ -715,6 +740,7 @@ return {
       harness.handle('open', async (args) => openFile(args && args.file))
       harness.handle('resolve', async (args) => resolvePath(args && args.file))
       harness.handle('diagnostics', () => safeDiagnostics())
+      harness.handle('dependencies', dependencyPayload)
       harness.handle('restart', async () => restartService())
     }
 
@@ -770,6 +796,11 @@ return {
         path: '/html-workbench/list',
         handler: guard('list', (req, res) => sendJson(res, 200, listPayload())),
       }), 'html-workbench: list route')
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/html-workbench/dependencies',
+        handler: guard('dependencies', async (req, res) => sendJson(res, 200, await dependencyPayload())),
+      }), 'html-workbench: dependencies route')
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/html-workbench/status',

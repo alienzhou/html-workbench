@@ -162,6 +162,17 @@ body[data-hwb-dragging] { user-select: none; cursor: col-resize; }
 .hwb-banner { flex: none; display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px 9px 14px; border-bottom: 1px solid var(--dsw-alias-border-l2); background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent); color: var(--dsw-alias-state-error-primary); font-size: 12px; }
 .hwb-banner > svg { flex: none; margin-top: 1px; }
 .hwb-banner-text { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.hwb-dependency-notice {
+  position: fixed; z-index: 10000; right: 16px; bottom: 16px;
+  box-sizing: border-box; width: min(400px, calc(100vw - 32px)); padding: 12px 14px;
+  display: flex; align-items: flex-start; gap: 10px; pointer-events: auto;
+  border: 1px solid var(--dsw-alias-border-l1, #d0d5dd); border-radius: 12px;
+  background: var(--dsw-alias-bg-base, #fff); color: var(--dsw-alias-label-primary, #1f2937);
+  box-shadow: var(--dsw-shadow-lv2, 0 6px 24px #0002); font-size: 13px; line-height: 1.5;
+}
+.hwb-dependency-notice-body { flex: 1; min-width: 0; }
+.hwb-dependency-notice p { margin: 4px 0; }
+.hwb-dependency-notice a { color: var(--dsw-alias-state-business-primary, #3448cf); text-decoration: underline; }
 
 /* ── Body ─────────────────────────────────────────────────────────────────── */
 .hwb-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; background: var(--dsw-alias-bg-base); }
@@ -287,6 +298,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       context: null,
       diag: null,
       diagOpen: false,
+      dependencyIssue: null,
       restarting: false,
       resolveTimer: null,
       resolveSequence: 0,
@@ -400,10 +412,18 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         && a.processStatus === b.processStatus && a.exitCode === b.exitCode
     }
 
+    const updateDependencyIssue = (response) => {
+      if (disposed || response?.dependencyIssue === undefined) return
+      const next = response.dependencyIssue
+      const previous = store.dependencyIssue
+      if (previous?.code !== next?.code || previous?.message !== next?.message) store.set({ dependencyIssue: next })
+    }
+
     const refresh = (explicit, target = store) => {
       if (explicit) target.set({ refreshing: true })
       return host.call('list').then((res) => {
         if (res && res.ok) {
+          updateDependencyIssue(res)
           const next = res.assets || []
           target.set({
             assets: sameAssets(target.assets, next) ? target.assets : next,
@@ -422,6 +442,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     const restartService = (target = store) => {
       target.set({ restarting: true, error: null })
       return host.call('restart').then((res) => {
+        updateDependencyIssue(res?.diagnostics)
         target.set({
           restarting: false,
           running: !!(res && res.ok),
@@ -1171,6 +1192,34 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       )
     }
 
+    const DependencyNotice = () => {
+      const { dependencyIssue } = useStore()
+      const [dismissed, setDismissed] = React.useState(null)
+      React.useEffect(() => {
+        let active = true
+        host.call('dependencies').then((res) => {
+          if (active && res?.ok) updateDependencyIssue(res)
+        }).catch(() => { /* The panel reports connection and host-version errors. */ })
+        return () => { active = false }
+      }, [])
+      if (!dependencyIssue || dismissed === dependencyIssue.message) return null
+      return React.createElement('div', { className: 'hwb-dependency-notice' },
+        React.createElement('div', { className: 'hwb-dependency-notice-body' },
+          React.createElement('div', { role: 'alert' },
+            React.createElement('strong', null, 'HTML Workbench 依赖未就绪'),
+            React.createElement('p', null, dependencyIssue.message),
+          ),
+          dependencyIssue.code.startsWith('PYTHON_') ? React.createElement('a', {
+            href: 'https://www.python.org/downloads/', target: '_blank', rel: 'noopener noreferrer',
+          }, '下载 Python') : null,
+        ),
+        React.createElement('button', {
+          type: 'button', className: 'hwb-icon', 'aria-label': '关闭依赖提示',
+          onClick: () => setDismissed(dependencyIssue.message),
+        }, I_CLOSE),
+      )
+    }
+
     const Trigger = () => {
       const s = useStore()
       if (s.seat !== 'overlay' || s.open) return null
@@ -1272,6 +1321,11 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     slots.inject('shell.overlay', () => slots.register(
       { name: 'shell.overlay', id: 'html-workbench-trigger', order: 59, label: 'HTML Workbench 入口' },
       () => React.createElement(Trigger),
+    ))
+
+    slots.inject('shell.overlay', () => slots.register(
+      { name: 'shell.overlay', id: 'html-workbench-dependencies', order: 61, label: 'HTML Workbench 依赖提示' },
+      () => React.createElement(DependencyNotice),
     ))
   },
 }

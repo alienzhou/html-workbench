@@ -25,7 +25,17 @@ const loadPlugin = () => new Function(HOST_BODY)()
 const collected = (text) => ({ text, truncated: false })
 
 /** A Cordis-ish context that records the routes the plugin registers. */
-const makeContext = (shell) => {
+const makeContext = (shell, { assumePython = true } = {}) => {
+  if (shell && assumePython) {
+    const version = { exitCode: 0, stdout: collected('Python 3.12.0') }
+    const isVersionProbe = (spec) => spec.command === 'python3 --version'
+    const executor = shell
+    shell = { ...executor }
+    if (executor.run) shell.run = (spec) => isVersionProbe(spec) ? version : executor.run(spec)
+    if (executor.execute) {
+      shell.execute = (spec) => isVersionProbe(spec) ? { result: () => version } : executor.execute(spec)
+    }
+  }
   const routes = new Map()
   const webServer = { register: ({ path, handler }) => (routes.set(path, handler), () => routes.delete(path)) }
   return {
@@ -69,7 +79,7 @@ const healthyShell = (version = '2.1.0') => ({
 })
 
 const boot = async (shell, config) => {
-  const ctx = makeContext(shell)
+  const ctx = makeContext(shell, { assumePython: config?.platform !== 'win32' })
   loadPlugin().apply(ctx, { script: '/tmp/fake/workbench.py', ...config })
   // `apply` kicks off startService without awaiting; give it room to settle.
   await new Promise((done) => setTimeout(done, 150))
@@ -471,7 +481,7 @@ test('a failed interpreter probe is cached instead of retried per keystroke', qu
   assert.equal(versionProbes, afterBoot, 'a known-failed probe must not respawn subprocesses')
   const diag = await callRoute(ctx, '/html-workbench/diagnostics')
   assert.match(diag.startError, /找不到可用的 Python 3 解释器/)
-  assert.match(diag.startError, /重启服务/, 'the message must say how to recover')
+  assert.match(diag.startError, /重启 DSH/, 'the message must say how to recover')
   const misses = diag.journal.filter((entry) => /找不到可用的 Python/.test(entry.message))
   assert.equal(misses.length, 1, 'the journal must not be flooded by one repeated cause')
 }))
@@ -530,6 +540,7 @@ test('the py launcher is expanded to an absolute path, never used as a prefix', 
   const shell = {
     resolve: (spec) => (commands.push(spec.command), spec),
     run: async (spec) => {
+      if (spec.command === '"' + executable + '" --version') return { exitCode: 0, stdout: collected('Python 3.12.0') }
       if (spec.command.endsWith('--version')) return { exitCode: 1, stdout: collected(''), stderr: collected('not found') }
       if (spec.command.startsWith('py -3 -c ')) return { exitCode: 0, stdout: collected(executable + '\n'), stderr: collected('') }
       if (spec.command.includes(' health ')) {
@@ -775,4 +786,33 @@ test('a public executor process that never becomes healthy is stopped at the sta
   } finally {
     Date.now = originalNow
   }
+}))
+
+test('the page can identify missing and outdated Python before opening a Workbench tab', quiet(async () => {
+  for (const detectedVersion of [null, 'Python 3.8.20']) {
+    let started = false
+    let versionProbes = 0
+    const shell = publicShell({
+      serve: () => { started = true },
+      foreground: () => {
+        versionProbes += 1
+        return { exitCode: detectedVersion ? 0 : 1, stdout: collected(detectedVersion || '') }
+      },
+    })
+    const ctx = makeContext(shell, { assumePython: false })
+    loadPlugin().apply(ctx, { script: '/tmp/fake/workbench.py', platform: 'linux' })
+    const result = await callRoute(ctx, '/html-workbench/dependencies')
+    assert.equal(result.dependencyIssue.code, detectedVersion ? 'PYTHON_TOO_OLD' : 'PYTHON_UNAVAILABLE')
+    assert.match(result.dependencyIssue.message, /Python 3\.9/)
+    if (detectedVersion) assert.ok(result.dependencyIssue.message.includes(detectedVersion))
+    assert.equal(started, false)
+    assert.equal(versionProbes, 2, 'page and startup share one interpreter probe')
+  }
+}))
+
+test('a failed GrapesJS download is reported as a startup dependency issue', quiet(async () => {
+  const ctx = await boot(dyingShell('{"ok":false,"error":"VENDOR_DOWNLOAD_FAILED"}'))
+  const result = await callRoute(ctx, '/html-workbench/dependencies')
+  assert.equal(result.dependencyIssue.code, 'VENDOR_DOWNLOAD_FAILED')
+  assert.match(result.dependencyIssue.message, /GrapesJS/)
 }))

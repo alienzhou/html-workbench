@@ -159,7 +159,7 @@ test('the body only needs the slot registry to load', () => {
 test('without a sidebar service the panel keeps the floating seat', () => {
   const app = mount()
 
-  assert.deepEqual(app.slots.entries.map((entry) => entry.key), ['shell.overlay', 'shell.overlay'])
+  assert.deepEqual(app.slots.entries.map((entry) => entry.key), ['shell.overlay', 'shell.overlay', 'shell.overlay'])
   assert.deepEqual([...app.context.injections.keys()], ['sidebarRightTabs', 'betterSidebar'])
 
   const sheet = app.sheet()
