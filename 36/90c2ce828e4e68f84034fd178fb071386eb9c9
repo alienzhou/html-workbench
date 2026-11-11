@@ -1,0 +1,30 @@
+dsh-plugin/src/host.js
+  s_e37463a0f3ee1d::t_4c26bd7c75dcc9 44,82-83,249-250,252,255-264,266,268,270,272-274,276-277,280-283
+  s_e37463a0f3ee1d::t_8db893da1b3008 646-648
+  s_e37463a0f3ee1d::t_356045116e09d9 362,366,369,378-382,413,444,458,557,624-625,645,649-651,743,799-803
+tests/host_diagnostics.test.mjs
+  s_e37463a0f3ee1d::t_bb212ea2265745 28-38,82,484,543,790-818
+tests/client_hosts.test.mjs
+  s_e37463a0f3ee1d::t_bb212ea2265745 162
+dsh-plugin/README.md
+  s_e37463a0f3ee1d::t_4c12491241dc14 7-14
+dsh-plugin/src/client.js
+  s_e37463a0f3ee1d::t_443f13ceb38469 165-175,301,415-421,426,445,1195-1222,1325-1328
+  s_e37463a0f3ee1d::t_c5e4632b258a8c 1329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3690c2ce828e4e68f84034fd178fb071386eb9c9",
+  "prompts": {},
+  "sessions": {
+    "s_e37463a0f3ee1d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1cb44-4bf0-79a0-9d97-d2af18fbf8ae",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "周鸿轩 <zhouhongxuan@BakMacBook-Pro.local>"
+    }
+  }
+}
