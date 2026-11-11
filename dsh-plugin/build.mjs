@@ -79,7 +79,7 @@ const bundle = `window.__ModuleLoader__.load({
           // useful thing to report is WHICH request died and what to check.
           const reason = (error && error.message) || String(error);
           throw new Error(
-            '无法连接 HTML Workbench 后台（' + method + '）。请求 ' + url + ' 没有到达 DSH。'
+            '无法连接 HTML Workbench 后台（' + method + '）。请求 /html-workbench/' + method + ' 没有到达 DSH。'
             + '通常说明插件的 Node 半没有加载成功，或 DSH 尚未重启以注册该路由。'
             + '请完全重启 DSH；若仍失败，请在启动 DSH 的终端里查找 [html-workbench] 开头的报错。'
             + '（底层错误：' + reason + '）'

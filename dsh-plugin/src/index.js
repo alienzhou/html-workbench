@@ -8,7 +8,7 @@
  * resolved relative to THIS module (`import.meta.url`) — never hard-coded to a
  * specific machine — and handed to the shared body as `config.script`.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -84,13 +84,38 @@ const runtimeDir = resolveRuntimeDir()
 const makePlugin = new Function(readFileSync(new URL('./host.js', import.meta.url), 'utf8'))
 const plugin = makePlugin()
 
+const LOG_MAX_BYTES = 1024 * 1024
+const LOG_BACKUP_COUNT = 2
+
+function createHostLog(directory, port) {
+  const logDir = join(directory, 'logs')
+  const file = join(logDir, 'dsh-host-' + port + '.log')
+  return {
+    file,
+    append(entry) {
+      mkdirSync(logDir, { recursive: true })
+      const line = JSON.stringify({ ...entry, at: new Date(entry.at).toISOString(), pid: process.pid }) + '\n'
+      const size = statSync(file, { throwIfNoEntry: false })?.size || 0
+      if (size + Buffer.byteLength(line) > LOG_MAX_BYTES) {
+        for (let i = LOG_BACKUP_COUNT; i >= 1; i -= 1) {
+          const from = i === 1 ? file : file + '.' + (i - 1)
+          const to = file + '.' + i
+          if (existsSync(from)) renameSync(from, to)
+        }
+      }
+      appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 })
+    },
+  }
+}
+
 export const name = 'html-workbench'
 export const inject = plugin.inject ?? []
 // Inject paths resolved by Node rather than assuming POSIX separators. A
 // deployment-provided config may still override every value.
-export const apply = (ctx, config) => plugin.apply(ctx, {
-  script: scriptPath,
-  runtimeDir,
-  version,
-  ...(config || {}),
-})
+export const apply = (ctx, config) => {
+  const options = { script: scriptPath, runtimeDir, version, ...(config || {}) }
+  return plugin.apply(ctx, {
+    ...options,
+    hostLog: createHostLog(options.runtimeDir || runtimeDir, options.port || 4317),
+  })
+}

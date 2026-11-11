@@ -40,6 +40,8 @@ dsh plugin --profile web add @vibe-x/dsh-html-workbench
 
 > **开发：** 插件源码在 [`dsh-plugin/`](./dsh-plugin/)。用 `node dsh-plugin/build.mjs`（或 `cd dsh-plugin && npm run build`）构建可分发的产物（client bundle、打包后的 Python 服务与前端）。
 
+遇到故障时，点插件面板顶部的 **HTML Workbench**，再点 **复制排查提示词**。把提示词发给故障电脑上的 Agent，它可以读取本地日志并整理反馈。面板打不开时也有可直接转发的提示词。[排查与反馈](./dsh-plugin/README.md#排查与反馈)
+
 ## 它解决什么问题
 
 - 不再在聊天窗口里反复描述“标题往下 20 像素”。

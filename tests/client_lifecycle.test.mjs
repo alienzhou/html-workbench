@@ -27,10 +27,11 @@ function makeDocument() {
   return { document, attached }
 }
 
-async function boot(t, onCall, { native = false, legacy = true } = {}) {
+async function boot(t, onCall, { native = false, legacy = true, clipboard } = {}) {
   const { document, attached } = makeDocument()
   const window = {
     innerWidth: 1600, localStorage: { getItem() { return null }, setItem() {} },
+    navigator: { clipboard },
     addEventListener() {}, removeEventListener() {},
   }
   const slots = {
@@ -133,6 +134,41 @@ async function openFile(renderer, value) {
   await typePath(renderer, value)
   await act(async () => renderer.root.findByType('input').props.onKeyDown({ key: 'Enter' }))
 }
+
+test('the troubleshooting prompt includes the log locations and startup failure', async (t) => {
+  let text
+  const app = await boot(t, method => method === 'list' ? {
+    ok: true, running: false, assets: [], port: 4317,
+    hostLogFile: '/tmp/logs/dsh-host-4317.log',
+    startupLogFile: '/tmp/fallback/workbench-4317.log',
+    service: { platform: 'win32', pid: 123, pythonExecutable: 'C:\\测试 Python\\python.exe',
+      logging: { error: 'WinError 32', droppedRecords: 7 } },
+    journal: [{ at: Date.now(), level: 'error', message: 'VENDOR_DOWNLOAD_FAILED' }],
+  } : undefined, { clipboard: { async writeText(value) { text = value } } })
+  const renderer = await app.mount('session', 'workbench')
+  await act(async () => renderer.root.findByProps({ className: 'hwb-statusbtn' }).props.onClick())
+  const button = renderer.root.findAllByType('button').find(node => node.props.children === '复制排查提示词')
+  await act(async () => button.props.onClick())
+  assert.match(text, /html-workbench-issue\.md/)
+  assert.match(text, /\/tmp\/logs\/dsh-host-4317\.log/)
+  assert.match(text, /\/tmp\/fallback\/workbench-4317\.log/)
+  assert.match(text, /VENDOR_DOWNLOAD_FAILED/)
+  assert.match(text, /PowerShell/)
+  assert.match(text, /Linux/)
+  assert.match(text, /macOS/)
+  assert.match(text, /WSL/)
+  assert.match(text, /WinError 32/)
+  assert.match(text, /服务未写入的日志条数: 7/)
+})
+
+test('a failed host connection still offers a copyable prompt without clipboard access', async (t) => {
+  const app = await boot(t, () => Promise.reject(new Error('DSH connection refused')))
+  const renderer = await app.mount('session', 'workbench')
+  await act(async () => renderer.root.findByProps({ className: 'hwb-statusbtn' }).props.onClick())
+  const button = renderer.root.findAllByType('button').find(node => node.props.children === '复制排查提示词')
+  await act(async () => button.props.onClick())
+  assert.match(renderer.root.findByType('textarea').props.value, /DSH connection refused/)
+})
 
 test('another session cannot replace a mounted editor, including while its open is pending', async (t) => {
   let finishB

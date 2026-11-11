@@ -43,9 +43,8 @@ return {
       ? [opts.pythonCommand]
       : (IS_WINDOWS ? ['python3', 'python'] : ['python3'])
     // Static packages inject the runtime directory resolved (and probed) by
-    // src/index.js. Keep a dynamic-loader fallback too: TEMP/TMPDIR cover
-    // Windows/macOS/Linux; only the final fallback is POSIX because dynamic
-    // runners may not expose Node's `os` module. The folder name matches
+    // src/index.js. Dynamic loads use TEMP/TMPDIR or the current workspace.
+    // The folder name matches
     // RUNTIME_DIR_NAME in workbench.py so both halves agree on one location.
     const tempRoot = typeof process !== 'undefined' && process.env
       ? (process.env.TEMP || process.env.TMP || process.env.TMPDIR)
@@ -55,9 +54,10 @@ return {
     // yield `C:\Temp\hwb\/logs` — a path Python tolerates but that reads as
     // corruption in every log line and error message a user pastes back.
     const trimSeparator = (value) => String(value).replace(/[\\/]+$/, '')
+    const currentDir = typeof process !== 'undefined' && typeof process.cwd === 'function' ? process.cwd() : '.'
     const RUNTIME_DIR = opts.runtimeDir
       ? trimSeparator(opts.runtimeDir)
-      : (tempRoot ? trimSeparator(tempRoot) + '/.html-workbench' : '/tmp/.html-workbench')
+      : trimSeparator(tempRoot || currentDir) + '/.html-workbench'
 
     // These are REQUESTS, not guarantees. The service runs as a DSH sandboxed
     // child that may write only the session workspace and a private temp folder
@@ -70,16 +70,23 @@ return {
     // cache/log data either way.
     const LOG_DIR = RUNTIME_DIR + '/logs'
     const VENDOR_CACHE = RUNTIME_DIR + '/vendor'
+    const hostLog = opts.hostLog || null
+    const nodeVersion = typeof process !== 'undefined' ? process.version : null
+    const arch = typeof process !== 'undefined' ? process.arch : null
+    const mode = typeof harness !== 'undefined' ? 'dynamic' : 'static'
+    let hostLogError = null
 
     // Directories the running service reported; null until it says so.
     let resolvedPaths = null
+    let serviceInfo = null
+    let startupLogFile
 
     let assets = []
     let seq = 0
     let ownedProcess = null
     let serviceRunning = false
     let startError = null
-    let pythonCommand = opts.pythonCommand || (IS_WINDOWS ? null : 'python3')
+    let pythonCommand = null
     // A failed probe must be remembered: `resolve` runs on every keystroke and
     // `health` on a timer, so re-probing would spawn three 5s subprocesses per
     // call and flood the journal with one repeated line. The TTL still lets a
@@ -153,8 +160,10 @@ return {
     }
 
     const note = (level, message, detail) => {
-      const text = String(message || '')
-      const body = detail ? String(detail).slice(0, 4000) : null
+      const text = String(message || '').slice(0, 2000)
+      const raw = detail ? String(detail) : null
+      const body = raw && raw.length > 4000 ? raw.slice(0, 1000) + '\n…（中间输出已截断）\n' + raw.slice(-3000) : raw
+      const at = Date.now()
       // Retrying a broken start replays the SAME failure verbatim, interleaved
       // with the "restarting" line — so consecutive-only folding would miss it.
       // Match anywhere, then move the entry to the end so its position still
@@ -166,12 +175,26 @@ return {
       }
       if (index >= 0) {
         const entry = journal.splice(index, 1)[0]
-        entry.at = Date.now()
+        entry.at = at
         entry.repeated = (entry.repeated || 1) + 1
         journal.push(entry)
       } else {
-        journal.push({ at: Date.now(), level: level, message: text, detail: body })
+        journal.push({ at, firstAt: at, level, message: text, detail: body })
         trimJournal()
+      }
+      const entry = journal[journal.length - 1]
+      if (entry.loggedAt != null && at - entry.loggedAt < 60000) return
+      entry.loggedAt = at
+      if (hostLog) {
+        try {
+          hostLog.append({ at, level, message: text, detail: body, port: PORT, version: VERSION,
+            firstAt: entry.firstAt, repeated: entry.repeated || 1 })
+          hostLogError = null
+        } catch (e) {
+          const failure = (e && e.message) || String(e)
+          if (hostLogError !== failure) console.error('[html-workbench] 无法写入宿主日志', failure)
+          hostLogError = failure
+        }
       }
       if (level === 'error') console.error('[html-workbench] ' + text, body || '')
     }
@@ -204,6 +227,8 @@ return {
       }
       return "'" + raw.replace(/'/g, "'\\''") + "'"
     }
+
+    pythonCommand = opts.pythonCommand ? quoteArg(opts.pythonCommand) : (IS_WINDOWS ? null : 'python3')
 
     const describeRun = (result) => {
       if (!result) return 'shell.run threw'
@@ -331,6 +356,11 @@ return {
     // output to read them from).
     const adoptResolvedPaths = (payload) => {
       if (!payload) return
+      serviceInfo = { version: payload.version || null, pythonVersion: payload.pythonVersion || null }
+      for (const key of ['platform', 'pid', 'pythonExecutable', 'logging']) {
+        if (key in payload) serviceInfo[key] = payload[key]
+      }
+      if ('logFile' in payload) serviceInfo.logFile = payload.logFile
       const logDir = typeof payload.logDir === 'string' ? payload.logDir : null
       const vendorCache = typeof payload.vendorCache === 'string' ? payload.vendorCache : null
       if (logDir || vendorCache) resolvedPaths = { logDir: logDir, vendorCache: vendorCache }
@@ -363,6 +393,7 @@ return {
         try {
           const payload = JSON.parse(trimmed)
           if (payload && payload.ok === false && payload.error) {
+            if ('logFile' in payload) startupLogFile = payload.logFile
             const hint = CLI_HINTS[payload.error]
             return (hint || payload.message || payload.error) + '（' + payload.error + '）'
           }
@@ -404,6 +435,7 @@ return {
       if (!SCRIPT) { startError = 'workbench.py 路径未配置（请用静态装载并随包分发 scripts/workbench.py）'; note('error', startError); return null }
       const python = await resolvePythonCommand()
       if (!python) return null
+      startupLogFile = undefined
       let proc = null
       const command = python + ' ' + quoteArg(SCRIPT) + ' serve --port ' + PORT
         + ' --log-dir ' + quoteArg(LOG_DIR)
@@ -415,16 +447,22 @@ return {
         if (disposed) { try { proc.kill() } catch (e) {} return null }
         ownedProcess = proc
         let transcript = ''
+        let lastProbe = null
         for (let i = 0; i < 240; i += 1) {
           const chunk = drain(proc)
-          if (chunk) transcript += (transcript ? '\n' : '') + chunk
+          if (chunk) transcript = (transcript + '\n' + chunk).trim().slice(-16000)
           const probe = await probeHealth()
+          lastProbe = probe
           if (probe && probe.ok) {
             serviceRunning = true
             startError = null
             healthConfirmedAt = Date.now()
             adoptResolvedPaths(probe.payload)
             note('info', '本地服务就绪：版本 ' + (probe.payload.version || '未知') + '，端口 ' + PORT)
+            if (probe.payload.logFile === null) {
+              const output = drain(proc)
+              note('warn', 'Python 服务未能启用文件日志', [transcript, output].filter(Boolean).join('\n'))
+            }
             return probe.payload
           }
           // Stop waiting the moment the process is gone. Polling health for the
@@ -436,19 +474,21 @@ return {
             // Lead with the CLI's own diagnosis when it gave one — "端口已被占用"
             // is actionable, "exit=1" is not.
             const explained = explainOutput(transcript)
-            startError = explained || ('serve 进程已退出（exit=' + String(proc.exitCode) + (proc.signal ? ', 信号 ' + proc.signal : '') + '）')
-            note('error', startError, transcript || '进程没有任何输出。命令：' + command)
+            const exit = 'serve 进程已退出（exit=' + String(proc.exitCode) + (proc.signal ? ', 信号 ' + proc.signal : '') + '）'
+            startError = explained || exit
+            note('error', startError, exit + '\n' + (transcript || '进程没有任何输出。命令：' + command))
             ownedProcess = null
             return null
           }
           await ctx.timeout(250)
         }
         startError = '服务在 60 秒内没有就绪（端口 ' + PORT + ' 未通过健康检查）'
-        note('error', startError, transcript || '进程仍在运行但健康检查一直失败。命令：' + command)
+        const probeDetail = lastProbe && (lastProbe.error || describeRun(lastProbe.result))
+        note('error', startError, [transcript, probeDetail && '最后一次健康检查：' + probeDetail, command].filter(Boolean).join('\n'))
         return null
       } catch (e) {
         startError = 'serve 进程启动失败：' + ((e && e.message) || String(e))
-        note('error', startError, command)
+        note('error', startError, [e && e.stack, command].filter(Boolean).join('\n'))
         if (proc) { try { proc.kill() } catch (e2) {} }
         ownedProcess = null
         return null
@@ -468,28 +508,30 @@ return {
       ownedProcess = null
       serviceRunning = false
       startError = explained || ('服务进程已退出（exit=' + String(proc.exitCode) + (proc.signal ? ', 信号 ' + proc.signal : '') + '）')
-      note('error', '服务进程意外退出', tail || '进程没有留下输出。可用「重启服务」重新拉起。')
+      note('error', '服务进程意外退出', [startError, tail || '进程没有留下输出。'].join('\n'))
     }
 
-    // A REUSED service has no process handle, so its death is invisible to the
-    // check above. Revalidate with a real health call — throttled, because this
-    // spawns a subprocess and the panel polls every few seconds. The window is
-    // seeded when the service is confirmed up, so a freshly verified service is
-    // not immediately re-checked.
+    // Periodically refresh health and log-write status for both owned and reused
+    // services. A live process handle alone cannot tell whether logging failed.
     const REVALIDATE_MS = 10000
     let healthConfirmedAt = 0
     let revalidating = false
 
     const revalidateService = () => {
-      if (revalidating || ownedProcess || !serviceRunning) return
+      if (revalidating || !serviceRunning) return
       if (Date.now() - healthConfirmedAt < REVALIDATE_MS) return
       revalidating = true
       void (async () => {
         try {
-          if (await health()) { healthConfirmedAt = Date.now(); return }
+          const probe = await probeHealth()
+          if (probe && probe.ok) {
+            adoptResolvedPaths(probe.payload)
+            healthConfirmedAt = Date.now()
+            return
+          }
           serviceRunning = false
-          startError = '之前复用的服务已经不再响应（端口 ' + PORT + '）。'
-          note('error', '复用的服务失去响应', '健康检查失败。可用「重启服务」重新拉起。')
+          startError = '本地服务已经不再响应（端口 ' + PORT + '）。'
+          note('error', '本地服务失去响应', probe && (probe.error || describeRun(probe.result)))
         } finally {
           revalidating = false
         }
@@ -499,32 +541,40 @@ return {
     // Everything the panel needs to explain a red dot without opening a terminal.
     // Reaping first means a process that died since the last call is reported as
     // dead here, instead of leaving a stale "running" dot behind.
+    const diagnosticFacts = () => ({
+      version: VERSION,
+      mode,
+      platform: PLATFORM,
+      arch,
+      nodeVersion,
+      shellAPI: shell ? ['resolve', 'execute', 'run', 'start'].filter(name => typeof shell[name] === 'function') : [],
+      port: PORT,
+      script: SCRIPT,
+      editorRoot: EDITOR_ROOT,
+      runtimeDir: RUNTIME_DIR,
+      pythonCommand,
+      pythonCandidates: PYTHON_CANDIDATES.slice(),
+      logDir: (resolvedPaths && resolvedPaths.logDir) || LOG_DIR,
+      vendorCache: (resolvedPaths && resolvedPaths.vendorCache) || VENDOR_CACHE,
+      hostLogFile: hostLog ? hostLog.file : null,
+      hostLogError,
+      service: serviceInfo,
+      startupLogFile,
+      hasShell: !!shell,
+      startError,
+      journal: journal.slice().reverse(),
+    })
+
     const diagnostics = () => {
       superviseOwnedProcess()
       revalidateService()
       return {
+        ...diagnosticFacts(),
         ok: true,
         running: serviceRunning,
         owned: !!ownedProcess,
-        version: VERSION,
-        platform: PLATFORM,
-        port: PORT,
-        script: SCRIPT,
-        editorRoot: EDITOR_ROOT,
-        runtimeDir: RUNTIME_DIR,
-        pythonCommand: pythonCommand,
-        pythonCandidates: PYTHON_CANDIDATES.slice(),
-        // Where the service really writes, once it has told us. The requested
-        // paths stand in only until then: they may be exactly what the sandbox
-        // refused, and showing them after the fact is what made a working service
-        // look broken.
-        logDir: (resolvedPaths && resolvedPaths.logDir) || LOG_DIR,
-        vendorCache: (resolvedPaths && resolvedPaths.vendorCache) || VENDOR_CACHE,
-        hasShell: !!shell,
         processStatus: ownedProcess ? ownedProcess.status : null,
         exitCode: ownedProcess ? ownedProcess.exitCode : null,
-        startError: startError,
-        journal: journal.slice().reverse(),
       }
     }
 
@@ -534,7 +584,9 @@ return {
       const proc = ownedProcess
       ownedProcess = null
       serviceRunning = false
-      if (proc) { try { proc.kill() } catch (e) { console.error('[html-workbench] stop failed', e) } }
+      if (proc) {
+        try { proc.kill() } catch (e) { note('error', '卸载插件时无法停止服务', e.stack || e) }
+      }
     })
 
     const recordAsset = (path, kind) => {
@@ -559,7 +611,7 @@ return {
         if (!/\.html?$/i.test(path)) return
         recordAsset(path, exec.name === 'write' ? 'create' : 'edit')
       } catch (e) {
-        console.error('[html-workbench] track failed', e)
+        note('error', '记录 HTML 产物时出错', e.stack || e)
       }
     })
 
@@ -571,10 +623,19 @@ return {
       if (!SCRIPT) return { ok: false, error: startError || 'workbench.py 路径未配置', diagnostics: diagnostics() }
       const wasUp = await health()
       if (!wasUp) await startService()
-      const h = await health()
+      const probe = await probeHealth()
       // Carry the diagnostics WITH the failure: the panel can then show the real
       // cause instead of a generic "unavailable" that sends the user hunting.
-      if (!h) return { ok: false, error: startError || '本地服务未就绪', diagnostics: diagnostics() }
+      if (!probe || !probe.ok) {
+        const detail = probe && (probe.error || describeRun(probe.result))
+        note('error', '打开编辑器时健康检查失败', detail || startError)
+        return { ok: false, error: startError || '本地服务未就绪', diagnostics: diagnostics() }
+      }
+      const h = probe.payload
+      adoptResolvedPaths(h)
+      serviceRunning = true
+      startError = null
+      healthConfirmedAt = Date.now()
       return {
         ok: true,
         url: 'http://127.0.0.1:' + PORT + '/?file=' + encodeURIComponent(file),
@@ -589,7 +650,9 @@ return {
       ownedProcess = null
       serviceRunning = false
       startError = null
-      if (proc) { try { proc.kill() } catch (e) {} }
+      if (proc) {
+        try { proc.kill() } catch (e) { note('error', '重启前无法停止服务进程', e.stack || e) }
+      }
       note('info', '手动重启本地服务')
       // Killing our own handle is not enough when the port is held by a process
       // we do not own (a leftover from a previous DSH run, or an outdated
@@ -613,9 +676,8 @@ return {
         const url = new URL(raw)
         if (url.protocol !== 'file:' || url.search || url.hash) return raw
         let path = decodeURIComponent(url.pathname)
-        const isWindows = typeof process !== 'undefined' && process.platform === 'win32'
-        if (isWindows && /^[\\/][A-Za-z]:\//.test(path)) path = path.slice(1)
-        if (isWindows && url.hostname && url.hostname !== 'localhost') path = '//' + url.hostname + path
+        if (IS_WINDOWS && /^[\\/][A-Za-z]:\//.test(path)) path = path.slice(1)
+        if (IS_WINDOWS && url.hostname && url.hostname !== 'localhost') path = '//' + url.hostname + path
         return path
       } catch (e) {
         return raw
@@ -636,15 +698,20 @@ return {
         return { ok: true, isHtml: true, exists: null, normalized: normalized, error: startError }
       }
       const probe = 'import os,sys; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)'
-      const spec = shell.resolve({
-        command: python + ' -c ' + quoteArg(probe) + ' ' + quoteArg(normalized),
-        timeoutMs: 5000,
-        stdoutMaxBytes: 1024,
-      })
       try {
+        const spec = shell.resolve({
+          command: python + ' -c ' + quoteArg(probe) + ' ' + quoteArg(normalized),
+          timeoutMs: 5000,
+          stdoutMaxBytes: 1024,
+        })
         const r = await runShell(spec)
-        return { ok: true, isHtml: true, exists: !!(r && r.exitCode === 0), normalized: normalized }
+        if (r && !r.timedOut && !r.aborted && !r.signal && [0, 1].includes(r.exitCode)) {
+          return { ok: true, isHtml: true, exists: r.exitCode === 0, normalized: normalized }
+        }
+        note('error', '文件检查未完成', describeRun(r))
+        return { ok: true, isHtml: true, exists: null, normalized, error: '文件检查未完成，请查看诊断日志。' }
       } catch (e) {
+        note('error', '文件检查未完成', e.stack || e)
         return { ok: true, isHtml: true, exists: null, normalized: normalized, error: (e && e.message) || String(e) }
       }
     }
@@ -673,28 +740,31 @@ return {
         return diagnostics()
       } catch (error) {
         return {
+          ...diagnosticFacts(),
           ok: false,
           degraded: true,
           error: '收集诊断信息时出错：' + ((error && error.message) || String(error)),
-          version: VERSION,
-          platform: PLATFORM,
-          port: PORT,
-          script: SCRIPT,
-          runtimeDir: RUNTIME_DIR,
-          startError: startError,
-          journal: journal.slice().reverse(),
         }
       }
     }
 
     // 动态传输：Package-private RPC（仅动态运行时存在 harness）。
     if (typeof harness !== 'undefined') {
-      harness.handle('list', () => listPayload())
-      harness.handle('status', () => statusPayload())
-      harness.handle('open', async (args) => openFile(args && args.file))
-      harness.handle('resolve', async (args) => resolvePath(args && args.file))
-      harness.handle('diagnostics', () => safeDiagnostics())
-      harness.handle('restart', async () => restartService())
+      const handle = (name, handler) => harness.handle(name, async (args) => {
+        try {
+          return await handler(args)
+        } catch (error) {
+          const reason = (error && error.stack) || String(error)
+          note('error', 'RPC ' + name + ' 处理失败', reason)
+          return { ok: false, error: (error && error.message) || String(error), diagnostics: safeDiagnostics() }
+        }
+      })
+      handle('list', listPayload)
+      handle('status', statusPayload)
+      handle('open', (args) => openFile(args && args.file))
+      handle('resolve', (args) => resolvePath(args && args.file))
+      handle('diagnostics', safeDiagnostics)
+      handle('restart', restartService)
     }
 
     // 静态传输：HTTP 路由，供静态 client bundle（fetch）与直接浏览器访问使用。
@@ -785,6 +855,7 @@ return {
     // A rejection here must not escape into Cordis: `apply` has already wired up
     // the transports, and losing them would take the diagnostics route down with
     // it — leaving the panel with nothing but "Failed to fetch" again.
+    note('info', '插件宿主已加载', JSON.stringify({ mode, platform: PLATFORM, arch, nodeVersion, script: SCRIPT, runtimeDir: RUNTIME_DIR }))
     Promise.resolve().then(startService).catch((error) => {
       startError = '启动本地服务时发生未预期的错误：' + ((error && error.message) || String(error))
       note('error', startError, (error && error.stack) || null)
