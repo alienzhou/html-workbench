@@ -185,107 +185,31 @@
       .button { transition: none; }
     }
   </style>
+<style data-grapesjs-overrides>
+* { box-sizing: border-box; } body {margin: 0;}#iys3z{display:none;}
+</style>
+
+
+
+
+
 </head>
 <body>
-  <header class="site-header">
-    <nav class="nav shell" aria-label="主导航">
-      <a class="brand" href="#top"><span class="brand-mark" aria-hidden="true"></span>HTML Workbench</a>
-      <ul class="nav-links">
-        <li><a href="#capabilities">编辑能力</a></li>
-        <li><a href="#workflow">使用流程</a></li>
-        <li><a href="#example">示例内容</a></li>
-      </ul>
-      <a class="button secondary" href="#start">开始体验</a>
-    </nav>
-  </header>
-
-  <main id="top">
-    <section class="hero shell">
-      <div>
-        <p class="eyebrow">本地 HTML 可视化工作台</p>
-        <h1>让页面直接进入可编辑状态</h1>
-        <p class="lead">保留源文件结构，在浏览器里调整内容、布局和样式，再安全写回磁盘。</p>
-        <div class="actions">
-          <a class="button" href="#start">打开示例</a>
-          <a class="button secondary" href="#workflow">了解流程</a>
-        </div>
-      </div>
-      <figure class="hero-media">
-        <img src="assets/workbench-studio.webp" alt="桌面上的网页线框稿和布局卡片" width="1536" height="1024">
-        <figcaption>从结构草图到可编辑页面</figcaption>
-      </figure>
-    </section>
-
-    <section class="metrics shell" aria-label="示例数据">
-      <div class="metric"><strong>1</strong><span>原始 HTML 文件</span></div>
-      <div class="metric"><strong>0</strong><span>额外 Python 依赖</span></div>
-      <div class="metric"><strong>4</strong><span>资源下载回退源</span></div>
-      <div class="metric"><strong>本地</strong><span>编辑与保存链路</span></div>
-    </section>
-
-    <section class="section shell" id="capabilities">
-      <div class="section-intro">
-        <h2>不只修改一段文字</h2>
-        <p>这个示例覆盖了常见页面结构，可以验证选择、拖拽、样式调整、响应式布局和资源加载。</p>
-      </div>
-      <div class="bento">
-        <article class="feature primary">
-          <div>
-            <h3>完整文档结构</h3>
-            <p>导航、主内容、语义化分区和页脚都保留在同一份 HTML 中。</p>
-          </div>
-          <pre class="code-block"><code>&lt;section class="hero"&gt;
+<header class="site-header"></header><main id="top"><section class="hero shell" id="i3coc" style="position: relative !important; left: 23px !important;"><nav aria-label="主导航" class="nav shell" id="iw18" style="position: relative !important; left: 22px !important; top: 2px !important;"><a href="#top" class="brand"><span aria-hidden="true" class="brand-mark"></span>HTML Workbench</a><ul class="nav-links"><li><a href="#capabilities">编辑能力</a></li><li><a href="#workflow">使用流程</a></li><li><a href="#example">示例内容</a></li></ul><a href="#start" class="button secondary" style="position: relative !important; left: -61px !important; top: 18px !important;">开始体验</a></nav><div><p class="eyebrow" style="position: relative !important; left: 22px !important; top: 17px !important;">本地 HTML 可视化工作台</p><h1 style="position: relative !important; left: 86px !important; top: 35px !important;">让页面直接进 入可编辑状态</h1><p class="lead" style="position: relative !important; left: 136px !important; top: -5px !important;">保留源文件结构，在浏览器里调整内容、布局和样式，再安全写回磁盘。</p><div class="actions"><a href="#start" class="button" style="position: relative !important; left: -23px !important; top: 29px !important;">打开示例</a><a href="#workflow" class="button secondary" style="position: relative !important; left: 158px !important; top: -31px !important;">了解流程</a></div></div><figure class="hero-media" style="box-shadow: var(--shadow), inset 0px 4px 12px 0px rgb(0 0 0 / 25%); left: 120.675px !important; top: -113.915px !important;"><img src="assets/workbench-studio.webp" alt="桌面上的网页线框稿和布局卡片" width="1536" height="1024" style="position: relative !important; left: 47px !important; top: -1px !important;"><figcaption>从结构草图到可编辑页面</figcaption></figure></section><section aria-label="示例数据" class="metrics shell"><div class="metric"><strong>1</strong><span>原始 HTML 文件</span></div><div class="metric"><strong>0</strong><span>额外 Python 依赖</span></div><div class="metric"><strong id="iys3z">4</strong><span>资源下载回退源</span></div><div class="metric"><strong>本地</strong><span>编辑与保存链路</span></div></section><section id="capabilities" class="section shell"><div class="section-intro"><h2>不只修改一段文字</h2><p>这个示例覆盖了常见页面结构，可以验证选择、拖拽、样式调整、响应式布局和资源加载。</p></div><div class="bento"><article class="feature primary" style="position: relative !important; top: -11px !important;"><div><h3>完整文档结构</h3><p>导航、主内容、语义化分区和页脚都保留在同一份 HTML 中。</p></div><pre class="code-block"><code>&lt;section class="hero"&gt;
   &lt;h1&gt;可编辑标题&lt;/h1&gt;
   &lt;p&gt;可编辑说明&lt;/p&gt;
-&lt;/section&gt;</code></pre>
-        </article>
-        <article class="feature accent">
-          <h3>样式可以继续演化</h3>
-          <p>修改颜色、间距、字体和圆角，结果会写回覆盖样式区域。</p>
-        </article>
-        <article class="feature">
-          <h3>相对资源可正常预览</h3>
-          <p>本地图片和样式资源通过安全地址映射加载，页面无需搬迁。</p>
-        </article>
-      </div>
-    </section>
+&lt;/section&gt;</code></pre></article><article class="feature accent" style="position: relative !important; left: 55px !important; top: -7px !important;"><h3>样式可以继续演化</h3><p>修改颜色、间距、字体和圆角，结果会写回覆盖样式区域。</p></article><article class="feature"><h3>相对资源可正常预览</h3><p>本地图片和样式资源通过安全地址映射加载，页面无需搬迁。</p></article></div></section><section id="workflow" class="section shell workflow"><div class="workflow-copy"><h2 style="position: relative !important; left: 0px !important; top: 0px !important;">从文件到编辑地址</h2><p style="">服务在后台完成检查和转换，使用者只需要打开返回的本地链接。</p></div><ol class="steps"><li class="step"><h3>准备页面</h3><p>生成或选择一份包含 head 和 body 的完整 HTML 文档。</p></li><li class="step"><h3>启动服务</h3><p>已有服务会直接复用，首次使用时下载并校验编辑器资源。</p></li><li class="step"><h3>可视化修改</h3><p>在画布中调整组件、文案和样式，同时监测磁盘文件变化。</p></li><li class="step"><h3>安全保存</h3><p>保存前校验文件版本，避免覆盖 AI 或其他工具刚完成的修改。</p></li></ol></section><section id="example" class="section shell"><div class="quote"><blockquote>“这份页面包含足够多的结构和视觉差异，可以真正验证编辑器是否好用。”</blockquote><p class="quote-meta"><strong>示例评审结论</strong>HTML Workbench 测试场景</p></div></section><section id="start" class="section shell"><div class="cta"><div><h2 contenteditable="plaintext-only">试着改掉这2222标题</h2><p>也可以替换图片、移动功能块、调整背景颜色，然后保存并检查源文件。</p></div><a href="#top" class="button">返回顶部</a></div></section></main><footer><div class="footer-inner shell"><span>HTML Workbench 示例页面</span><span>纯 HTML、CSS 与本地资源</span></div></footer>
 
-    <section class="section shell workflow" id="workflow">
-      <div class="workflow-copy">
-        <h2>从文件到编辑地址</h2>
-        <p>服务在后台完成检查和转换，使用者只需要打开返回的本地链接。</p>
-      </div>
-      <ol class="steps">
-        <li class="step"><h3>准备页面</h3><p>生成或选择一份包含 head 和 body 的完整 HTML 文档。</p></li>
-        <li class="step"><h3>启动服务</h3><p>已有服务会直接复用，首次使用时下载并校验编辑器资源。</p></li>
-        <li class="step"><h3>可视化修改</h3><p>在画布中调整组件、文案和样式，同时监测磁盘文件变化。</p></li>
-        <li class="step"><h3>安全保存</h3><p>保存前校验文件版本，避免覆盖 AI 或其他工具刚完成的修改。</p></li>
-      </ol>
-    </section>
 
-    <section class="section shell" id="example">
-      <div class="quote">
-        <blockquote>“这份页面包含足够多的结构和视觉差异，可以真正验证编辑器是否好用。”</blockquote>
-        <p class="quote-meta"><strong>示例评审结论</strong>HTML Workbench 测试场景</p>
-      </div>
-    </section>
 
-    <section class="section shell" id="start">
-      <div class="cta">
-        <div>
-          <h2>试着改掉这段标题</h2>
-          <p>也可以替换图片、移动功能块、调整背景颜色，然后保存并检查源文件。</p>
-        </div>
-        <a class="button" href="#top">返回顶部</a>
-      </div>
-    </section>
-  </main>
 
-  <footer>
-    <div class="footer-inner shell">
-      <span>HTML Workbench 示例页面</span>
-      <span>纯 HTML、CSS 与本地资源</span>
-    </div>
-  </footer>
+<style data-wb-layer-visibility="">[data-wb-hidden]{display:none!important}</style>
+
+
+
+
+
+<section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><section><h2>新章节</h2><p>输入正文</p></section><img alt=""><p>双击编辑文字</p><img alt=""><section><h2>新章节</h2><p>输入正文</p></section><p>双击编辑文字</p>
+
 </body>
 </html>
