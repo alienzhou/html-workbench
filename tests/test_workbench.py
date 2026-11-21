@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -59,33 +60,33 @@ class BundleInspector(HTMLParser):
 
 
 class BundleTests(unittest.TestCase):
-    def test_frontend_keeps_only_vendor_assets_external(self):
+    def test_frontend_bundle_is_self_contained(self):
         bundle = PROJECT_ROOT / "skill" / "html-workbench" / "assets" / "workbench.html"
         inspector = BundleInspector()
         inspector.feed(bundle.read_text(encoding="utf-8"))
         self.assertTrue(inspector.scripts)
         self.assertEqual(
             [script.get("src") for script in inspector.scripts if script.get("src")],
-            ["/vendor/grapesjs/grapes.min.js"],
+            [],
         )
         self.assertEqual(
             [link.get("href") for link in inspector.links if link.get("rel") == "stylesheet"],
-            ["/vendor/grapesjs/css/grapes.min.css"],
+            [],
         )
         self.assertEqual(sorted(inspector.bundles), [
             ("script", "workbench"),
             ("style", "workbench"),
         ])
-        self.assertLess(bundle.stat().st_size, 100_000)
+        self.assertLess(bundle.stat().st_size, 145_000)
 
     def test_frontend_exposes_edit_and_preview_modes(self):
         bundle = PROJECT_ROOT / "skill" / "html-workbench" / "assets" / "workbench.html"
         source = bundle.read_text(encoding="utf-8")
         self.assertIn('data-mode="edit"', source)
         self.assertIn('data-mode="preview"', source)
-        self.assertIn('id="preview-frame"', source)
-        self.assertIn("previewFrame.srcdoc = buildPreviewDocument()", source)
-        self.assertIn("workbenchMode !== 'edit'", source)
+        self.assertIn("'iframe', 'board-preview'", source)
+        self.assertIn("board.preview.srcdoc = frameSource(board, board.current)", source)
+        self.assertIn("mode !== 'edit'", source)
 
 
 class ParserTests(unittest.TestCase):
@@ -96,7 +97,9 @@ class ParserTests(unittest.TestCase):
         self.assertIn("class=\"bento", document["bodyHtml"])
         self.assertIn("class=\"workflow", document["bodyHtml"])
         self.assertIn("assets/workbench-studio.webp", document["bodyHtml"])
-        self.assertGreater(len(document["bodyHtml"]), 3_000)
+        self.assertGreaterEqual(document["bodyHtml"].count("<section"), 3)
+        self.assertIn("<h1", document["bodyHtml"])
+        self.assertIn("<img", document["bodyHtml"])
 
     def test_extracts_document_context(self):
         document = workbench.parse_source(SAMPLE_HTML)
@@ -191,6 +194,107 @@ class SaveTests(unittest.TestCase):
         self.assertIn("External", context.exception.extra["document"]["html"])
 
 
+class FontMetadataTests(unittest.TestCase):
+    def test_reads_family_alias_and_weight_from_font_tables(self):
+        strings = b""
+        records = b""
+        for language, name_id, text in (
+            (0x0409, 1, "Sample Sans"),
+            (0x0804, 1, "示例字体"),
+            (0x0409, 2, "SemiBold"),
+        ):
+            value = text.encode("utf-16-be")
+            records += struct.pack(">HHHHHH", 3, 1, language, name_id, len(value), len(strings))
+            strings += value
+        names = struct.pack(">HHH", 0, 3, 6 + len(records)) + records + strings
+        os2 = struct.pack(">HhH", 0, 0, 600)
+        header = struct.pack(">4sHHHH", b"OTTO", 2, 0, 0, 0)
+        offset = len(header) + 32
+        tables = struct.pack(">4sIII4sIII", b"name", 0, offset, len(names),
+                             b"OS/2", 0, offset + len(names), len(os2))
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "filename-is-not-the-font-family.otf"
+            path.write_bytes(header + tables + names + os2)
+            self.assertEqual(workbench.font_faces(path), [
+                {"family": "Sample Sans", "aliases": ["示例字体"], "style": "SemiBold", "weight": 600},
+            ])
+
+
+class BatchSaveTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        self.journal = self.root / "journal.json"
+        self.pages = [self.root / folder / "index.html" for folder in ("first", "second")]
+        for page in self.pages:
+            page.parent.mkdir()
+            page.write_bytes(SAMPLE_HTML.replace("\n", "\r\n").encode("utf-8"))
+        self.before = [page.read_bytes() for page in self.pages]
+
+    def changes(self):
+        return [
+            {"file": str(page), "baseRevision": workbench.read_document(page)["revision"],
+             "html": SAMPLE_HTML.replace("Hello", f"Edit {index}")}
+            for index, page in enumerate(self.pages)
+        ]
+
+    def test_stale_file_leaves_every_other_file_untouched(self):
+        changes = self.changes()
+        external = SAMPLE_HTML.replace("Hello", "External")
+        self.pages[1].write_text(external, encoding="utf-8")
+        with self.assertRaises(workbench.WorkbenchError) as caught:
+            workbench.save_batch(self.journal, changes)
+        self.assertEqual(caught.exception.code, "REVISION_CONFLICT")
+        self.assertEqual(caught.exception.extra["file"], str(self.pages[1]))
+        self.assertEqual(self.pages[0].read_bytes(), self.before[0])
+        self.assertEqual(self.pages[1].read_text(encoding="utf-8"), external)
+        self.assertFalse(self.journal.exists())
+
+    def test_interrupted_batch_is_recovered_from_journal(self):
+        original_write = workbench.write_atomic
+
+        def interrupt(target, content):
+            if target == self.pages[1]:
+                raise KeyboardInterrupt()
+            original_write(target, content)
+
+        with mock.patch.object(workbench, "write_atomic", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                workbench.save_batch(self.journal, self.changes())
+        self.assertNotEqual(self.pages[0].read_bytes(), self.before[0])
+        self.assertEqual(self.pages[1].read_bytes(), self.before[1])
+        self.assertTrue(self.journal.exists())
+        workbench.recover_batch(self.journal)
+        self.assertEqual([page.read_bytes() for page in self.pages], self.before)
+        self.assertFalse(self.journal.exists())
+
+    def test_success_returns_revisions_for_both_same_named_files(self):
+        changes = self.changes()
+        result = workbench.save_batch(self.journal, changes)
+        self.assertEqual([item["filePath"] for item in result], list(map(str, self.pages)))
+        self.assertEqual([page.read_text(encoding="utf-8") for page in self.pages], [item["html"] for item in changes])
+        self.assertFalse(self.journal.exists())
+
+    def test_external_write_during_batch_is_preserved_and_other_file_rolls_back(self):
+        original_write = workbench.write_atomic
+        external = SAMPLE_HTML.replace("Hello", "External")
+        changes = self.changes()
+
+        def concurrent_write(target, content):
+            original_write(target, content)
+            if target == self.pages[1] and content == changes[1]["html"]:
+                target.write_text(external, encoding="utf-8")
+
+        with mock.patch.object(workbench, "write_atomic", side_effect=concurrent_write):
+            with self.assertRaises(workbench.WorkbenchError) as caught:
+                workbench.save_batch(self.journal, changes)
+        self.assertEqual(caught.exception.code, "REVISION_CONFLICT")
+        self.assertEqual(self.pages[0].read_bytes(), self.before[0])
+        self.assertEqual(self.pages[1].read_text(encoding="utf-8"), external)
+        self.assertFalse(self.journal.exists())
+
+
 class HttpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -222,6 +326,56 @@ class HttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + route, timeout=2) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
 
+    def test_batch_endpoint_saves_revision_checked_source(self):
+        target = self.page.resolve()
+        change = {"file": str(target), "baseRevision": workbench.read_document(target)["revision"],
+                  "html": SAMPLE_HTML.replace("Hello", "Batch")}
+        request = urllib.request.Request(self.base + "/api/batch", method="PUT",
+                                         data=json.dumps({"changes": [change]}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            result = json.load(response)
+        self.assertEqual(result["documents"][0]["html"], change["html"])
+        self.assertEqual(target.read_text(encoding="utf-8"), change["html"])
+
+    def test_version_history_preserves_current_before_restore_and_rejects_stale_requests(self):
+        target = self.page.resolve()
+        route = "/api/versions?" + urllib.parse.urlencode({"file": str(target)})
+        _, initial = self.read_json(route)
+        old_revision = initial["current"]["revision"]
+        self.assertEqual(initial["versions"], [])
+
+        updated = SAMPLE_HTML.replace("Hello", "Updated")
+        change = {"file": str(target), "baseRevision": old_revision, "html": updated}
+        save = urllib.request.Request(self.base + "/api/batch", method="PUT",
+                                      data=json.dumps({"changes": [change]}).encode("utf-8"),
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(save, timeout=2) as response:
+            new_revision = json.load(response)["documents"][0]["revision"]
+
+        _, history = self.read_json(route)
+        self.assertEqual(history["current"]["revision"], new_revision)
+        self.assertEqual([entry["revision"] for entry in history["versions"]], [old_revision])
+        _, historical = self.read_json(route + "&revision=" + old_revision)
+        self.assertEqual(historical["html"], SAMPLE_HTML)
+
+        def restore(base_revision):
+            return urllib.request.Request(self.base + route, method="POST",
+                                          data=json.dumps({"baseRevision": base_revision, "revision": old_revision}).encode("utf-8"),
+                                          headers={"Content-Type": "application/json"})
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(restore(old_revision), timeout=2)
+        self.assertEqual(caught.exception.code, 409)
+        self.assertEqual(target.read_text(encoding="utf-8"), updated)
+
+        with urllib.request.urlopen(restore(new_revision), timeout=2) as response:
+            self.assertEqual(json.load(response)["html"], SAMPLE_HTML)
+        self.assertEqual(target.read_text(encoding="utf-8"), SAMPLE_HTML)
+        _, restored = self.read_json(route)
+        self.assertEqual(restored["current"]["revision"], old_revision)
+        self.assertEqual([entry["revision"] for entry in restored["versions"]], [new_revision])
+
     def test_health_and_document_endpoints(self):
         status, health = self.read_json("/api/health")
         self.assertEqual(status, 200)
@@ -250,6 +404,40 @@ class HttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + route, timeout=2) as response:
             self.assertEqual(response.read(), b"test-grapes.min.js")
             self.assertIn("immutable", response.headers["Cache-Control"])
+
+    def test_lists_nested_html_files_relative_to_working_directory(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        (nested / "other.HTML").write_text(SAMPLE_HTML, encoding="utf-8")
+        (nested / "skip.txt").write_text("no", encoding="utf-8")
+        query = urllib.parse.urlencode({"directory": str(self.root)})
+        status, result = self.read_json(f"/api/files?{query}")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["directory"], str(self.root.resolve()))
+        self.assertEqual([item["relativePath"] for item in result["files"]], ["nested/other.HTML", "page.html", "workbench.html"])
+
+    def test_preview_adds_an_asset_base_without_changing_source(self):
+        query = urllib.parse.urlencode({"file": str(self.page)})
+        with urllib.request.urlopen(self.base + f"/api/preview?{query}", timeout=2) as response:
+            preview = response.read().decode("utf-8")
+        self.assertIn('<base href="/assets/', preview)
+        self.assertEqual(self.page.read_text(encoding="utf-8"), SAMPLE_HTML)
+
+    def test_document_asset_base_resolves_parent_relative_resources(self):
+        folder = self.root / "子目录"
+        folder.mkdir()
+        page = folder / "index.html"
+        page.write_text(SAMPLE_HTML, encoding="utf-8")
+        (self.root / "asset.svg").write_text("<svg/>", encoding="utf-8")
+        _, document = self.read_json("/api/document?" + urllib.parse.urlencode({"file": str(page)}))
+        resource = urllib.parse.urljoin(document["assetBase"], "../asset.svg")
+        with urllib.request.urlopen(self.base + resource, timeout=2) as response:
+            self.assertEqual(response.read(), b"<svg/>")
+
+    def test_font_endpoint_returns_a_list(self):
+        status, result = self.read_json("/api/fonts")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(result["fonts"], list)
 
     def test_failed_request_can_be_correlated_without_logging_query_or_body(self):
         query = urllib.parse.urlencode({"file": str(self.page), "marker": "private-query-marker"})

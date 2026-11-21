@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bisect
+import gzip
 import hashlib
 import html
 import io
@@ -16,6 +17,7 @@ import os
 import re
 import secrets
 import signal
+import struct
 import subprocess
 import sys
 import tarfile
@@ -53,6 +55,11 @@ SERVICE_CAPABILITIES = (
     "file-watch",
     "stdlib-python",
     "visual-context",
+    "workspace-batch-save",
+    "workspace-board-assets",
+    "local-font-families",
+    "conditional-document-read",
+    "document-version-history",
 )
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 SCRIPT_PATTERN = re.compile(r"^<script\b[\s\S]*</script\s*>$", re.IGNORECASE)
@@ -644,6 +651,7 @@ def parse_source(source: str) -> dict[str, Any]:
         "htmlAttributes": html_node.attrs,
         "bodyAttributes": body_node.attrs,
         "locations": {
+            "headStart": head_node.start_end,
             "bodyStart": body_node.start_end,
             "bodyEnd": body_node.end_start,
             "headEnd": head_node.end_start,
@@ -1231,15 +1239,16 @@ def promote_identities(target: Path, descriptors: list[dict[str, Any]], base_rev
     return {"revision": revision_of(updated), "assigned": assigned, "changed": True}
 
 
-def write_atomic(target: Path, content: str) -> None:
+def write_atomic(target: Path, content: str | bytes) -> None:
     temporary_name: Path | None = None
     try:
         descriptor, temporary_name = make_temp_file(target.parent, prefix=f".{target.name}.workbench-", suffix=".tmp")
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
-            output.write(content)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content.encode("utf-8") if isinstance(content, str) else content)
             output.flush()
             os.fsync(output.fileno())
-        os.chmod(temporary_name, target.stat().st_mode)
+        if target.exists():
+            os.chmod(temporary_name, target.stat().st_mode)
         os.replace(temporary_name, target)
     finally:
         if temporary_name and os.path.exists(temporary_name):
@@ -1407,7 +1416,7 @@ def resolve_html_file(raw_file: str) -> Path:
         target = requested.resolve(strict=True)
     except FileNotFoundError as caught:
         raise WorkbenchError("FILE_NOT_FOUND", f"找不到文件：{requested.resolve()}", 404) from caught
-    if target.suffix.lower() != ".html":
+    if target.suffix.lower() != ".html" or not target.is_file():
         raise WorkbenchError("INVALID_DOCUMENT", "只支持本地 .html 文件。", 400)
     return target
 
@@ -1424,9 +1433,16 @@ def decode_asset_token(token: str) -> str:
         raise WorkbenchError("INVALID_ASSET", "资源地址无效。", 400) from caught
 
 
-def read_document(target: Path) -> dict[str, Any]:
+def document_asset_base(target: Path) -> str:
+    # Put actual directory segments in the URL so the browser can resolve
+    # ../ references in documents, imported stylesheets, and CSS url() values.
+    directories = "/".join(urllib.parse.quote(part, safe="") for part in target.parent.parts[1:])
+    return f"/assets/{encode_asset_token(target)}/~/{directories}/" if directories else f"/assets/{encode_asset_token(target)}/~/"
+
+
+def read_document(target: Path, raw: bytes | None = None) -> dict[str, Any]:
     try:
-        source = target.read_text(encoding="utf-8")
+        source = (target.read_bytes() if raw is None else raw).decode("utf-8")
     except UnicodeDecodeError as caught:
         raise WorkbenchError("INVALID_DOCUMENT", "HTML 文件必须使用 UTF-8 编码。", 400) from caught
     parsed = parse_source(source)
@@ -1438,11 +1454,12 @@ def read_document(target: Path) -> dict[str, Any]:
         "mtimeMs": stat.st_mtime * 1000,
         "filePath": str(target),
         "fileName": target.name,
-        "assetBase": f"/assets/{encode_asset_token(target)}/",
+        "directory": str(target.parent),
+        "assetBase": document_asset_base(target),
     }
 
 
-def save_document(target: Path, body: dict[str, Any]) -> dict[str, Any]:
+def prepare_document(current: dict[str, Any], body: dict[str, Any]) -> str:
     base_revision = body.get("baseRevision")
     body_html = body.get("bodyHtml")
     css = body.get("css")
@@ -1453,7 +1470,6 @@ def save_document(target: Path, body: dict[str, Any]) -> dict[str, Any]:
     if re.search(r"<(?:html|head|body)\b", body_html, re.IGNORECASE) or re.search(r"<script\b", body_html, re.IGNORECASE):
         raise WorkbenchError("INVALID_SAVE", "bodyHtml 不允许包含 html、head、body 或 script。", 400)
 
-    current = read_document(target)
     if current["revision"] != base_revision:
         raise WorkbenchError("REVISION_CONFLICT", "磁盘文件已被外部修改，未覆盖最新版。", 409, document=current)
 
@@ -1477,22 +1493,279 @@ def save_document(target: Path, body: dict[str, Any]) -> dict[str, Any]:
     body_end = refreshed["locations"]["bodyEnd"]
     source = source[:body_start] + "\n" + next_body + "\n" + source[body_end:]
 
-    latest = read_document(target)
-    if latest["revision"] != base_revision:
-        raise WorkbenchError("REVISION_CONFLICT", "保存期间文件发生外部修改，未覆盖最新版。", 409, document=latest)
+    return source
 
-    descriptor, temporary_name = make_temp_file(target.parent, prefix=f".{target.name}.workbench-", suffix=".tmp")
+
+def versions_directory(target: Path) -> Path:
+    return target.parent / RUNTIME_DIR_NAME / "versions" / revision_of(target.name)
+
+
+def archive_version(target: Path, source: str, revision: str, mtime_ms: float) -> None:
+    directory = versions_directory(target)
+    snapshot = directory / (revision + ".gz")
+    if snapshot.exists():
+        return
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    self_ignore(directory)
+    write_atomic(snapshot, gzip.compress(source.encode("utf-8"), compresslevel=3, mtime=0))
+    os.utime(snapshot, (mtime_ms / 1000, mtime_ms / 1000))
+    sync_directory(directory)
+
+
+def document_versions(target: Path) -> dict[str, Any]:
+    current = read_document(target)
+    versions = []
+    for snapshot in versions_directory(target).glob("*.gz"):
+        revision = snapshot.stem
+        if revision == current["revision"] or not re.fullmatch(r"[a-f0-9]{64}", revision):
+            continue
+        versions.append({"revision": revision, "mtimeMs": snapshot.stat().st_mtime * 1000})
+    versions.sort(key=lambda item: item["mtimeMs"], reverse=True)
+    return {
+        "current": {"revision": current["revision"], "mtimeMs": current["mtimeMs"]},
+        "versions": versions,
+    }
+
+
+def version_source(target: Path, revision: Any) -> str:
+    if not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{64}", revision):
+        raise WorkbenchError("INVALID_VERSION", "无效的历史版本。", 400)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
-            output.write(source)
-            output.flush()
-            os.fsync(output.fileno())
-        os.chmod(temporary_name, target.stat().st_mode)
-        os.replace(temporary_name, target)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+        source = gzip.decompress((versions_directory(target) / (revision + ".gz")).read_bytes()).decode("utf-8")
+    except FileNotFoundError as caught:
+        raise WorkbenchError("VERSION_NOT_FOUND", "找不到这个历史版本。", 404) from caught
+    if revision_of(source) != revision:
+        raise WorkbenchError("INVALID_VERSION", "历史版本校验失败。", 409)
+    return source
+
+
+def restore_version(journal: Path, target: Path, body: dict[str, Any]) -> dict[str, Any]:
+    return save_batch(journal, [{
+        "file": str(target),
+        "baseRevision": body.get("baseRevision"),
+        "html": version_source(target, body.get("revision")),
+    }])[0]
+
+
+def save_document(target: Path, body: dict[str, Any]) -> dict[str, Any]:
+    source = prepare_document(read_document(target), body)
+    latest = read_document(target)
+    if latest["revision"] != body["baseRevision"]:
+        raise WorkbenchError("REVISION_CONFLICT", "保存期间文件发生外部修改，未覆盖最新版。", 409, document=latest)
+    if latest["html"] != source:
+        archive_version(target, latest["html"], latest["revision"], latest["mtimeMs"])
+        if target.read_bytes() != latest["html"].encode("utf-8"):
+            raise WorkbenchError("REVISION_CONFLICT", "保存期间文件发生外部修改，未覆盖最新版。", 409)
+        write_atomic(target, source)
     return read_document(target)
+
+
+def sync_directory(directory: Path) -> None:
+    if os.name != "nt":
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def recover_batch(journal: Path) -> None:
+    if not journal.exists():
+        return
+    entries = json.loads(journal.read_text(encoding="utf-8"))
+    conflicts = []
+    for entry in entries:
+        target = Path(entry["file"])
+        try:
+            current = target.read_bytes()
+        except FileNotFoundError:
+            conflicts.append(str(target))
+            continue
+        original = entry["before"].encode("utf-8")
+        if current == original:
+            continue
+        if sha256_bytes(current) != entry["afterHash"]:
+            conflicts.append(str(target))
+            continue
+        write_atomic(target, entry["before"])
+        sync_directory(target.parent)
+    journal.unlink()
+    sync_directory(journal.parent)
+    if conflicts:
+        get_logger().warning("batch_recovery_preserved_external_changes count=%d", len(conflicts))
+
+
+def save_batch(journal: Path, changes: Any) -> list[dict[str, Any]]:
+    if not isinstance(changes, list) or not 1 <= len(changes) <= 128:
+        raise WorkbenchError("INVALID_SAVE", "请选择 1 至 128 个待保存文件。", 400)
+    recover_batch(journal)
+    prepared: dict[Path, tuple[str, str]] = {}
+    baselines: dict[Path, tuple[str, float]] = {}
+    for change in changes:
+        if not isinstance(change, dict) or not isinstance(change.get("file"), str):
+            raise WorkbenchError("INVALID_SAVE", "每项修改须指定文件路径。", 400)
+        target = resolve_html_file(change["file"])
+        if target in prepared:
+            raise WorkbenchError("INVALID_SAVE", "同一文件只能提交一次。", 400)
+        current = read_document(target)
+        before = current["html"]
+        if current["revision"] != change.get("baseRevision"):
+            raise WorkbenchError("REVISION_CONFLICT", f"磁盘文件已被外部修改：{target}", 409, file=str(target), document=current)
+        if "html" in change:
+            after = change["html"]
+            if not isinstance(after, str):
+                raise WorkbenchError("INVALID_SAVE", "HTML 源码须为文本。", 400)
+            parse_source(after)
+        else:
+            after = prepare_document(current, change)
+        prepared[target] = (before, after)
+        baselines[target] = (current["revision"], current["mtimeMs"])
+
+    entries = [
+        {"file": str(target), "before": before, "afterHash": sha256_bytes(after.encode("utf-8"))}
+        for target, (before, after) in prepared.items() if before != after
+    ]
+    if not entries:
+        return [read_document(target) for target in prepared]
+
+    for target, (before, after) in prepared.items():
+        if before != after:
+            revision, mtime_ms = baselines[target]
+            archive_version(target, before, revision, mtime_ms)
+
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(journal, json.dumps(entries, ensure_ascii=False))
+    sync_directory(journal.parent)
+    try:
+        for target, (before, _) in prepared.items():
+            if target.read_bytes() != before.encode("utf-8"):
+                raise WorkbenchError("REVISION_CONFLICT", f"保存期间文件发生外部修改：{target}", 409, file=str(target))
+        for target, (before, after) in prepared.items():
+            if before != after:
+                if target.read_bytes() != before.encode("utf-8"):
+                    raise WorkbenchError("REVISION_CONFLICT", f"保存期间文件发生外部修改：{target}", 409, file=str(target))
+                write_atomic(target, after)
+                sync_directory(target.parent)
+        results = []
+        for target, (_, after) in prepared.items():
+            result = read_document(target)
+            if result["html"] != after:
+                raise WorkbenchError("REVISION_CONFLICT", f"保存期间文件发生外部修改：{target}", 409, file=str(target))
+            results.append(result)
+    except Exception:
+        recover_batch(journal)
+        raise
+    journal.unlink()
+    sync_directory(journal.parent)
+    return results
+
+
+def font_directories() -> tuple[Path, ...]:
+    home = Path.home()
+    if sys.platform == "darwin":
+        managed = tuple(Path("/System/Library/AssetsV2").glob("com_apple_MobileAsset_Font*"))
+        return (home / "Library/Fonts", Path("/Library/Fonts"), Path("/System/Library/Fonts"), *managed)
+    if os.name == "nt":
+        windows = Path(os.environ.get("WINDIR", "C:/Windows"))
+        local = Path(os.environ.get("LOCALAPPDATA", str(home / "AppData/Local")))
+        return (windows / "Fonts", local / "Microsoft/Windows/Fonts")
+    data_home = Path(os.environ.get("XDG_DATA_HOME", str(home / ".local/share")))
+    return (data_home / "fonts", home / ".fonts", Path("/usr/local/share/fonts"), Path("/usr/share/fonts"))
+
+
+def font_faces(path: Path) -> list[dict[str, Any]]:
+    """Read localized OpenType names and the CSS weight class without loading font outlines."""
+    faces = []
+    with path.open("rb") as stream:
+        header = stream.read(12)
+        if header[:4] == b"ttcf":
+            count = struct.unpack(">I", header[8:12])[0]
+            if count > 512:
+                return []
+            offsets = struct.unpack(f">{count}I", stream.read(count * 4))
+        else:
+            offsets = (0,)
+        for offset in offsets:
+            stream.seek(offset)
+            header = stream.read(12)
+            if header[:4] not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+                continue
+            count = struct.unpack(">H", header[4:6])[0]
+            if count > 256:
+                continue
+            tables = {
+                tag: (start, length)
+                for tag, _, start, length in struct.iter_unpack(">4sIII", stream.read(count * 16))
+            }
+            if b"name" not in tables:
+                continue
+            start, length = tables[b"name"]
+            if not 6 <= length <= 1_000_000:
+                continue
+            stream.seek(start)
+            names = stream.read(length)
+            _, records, strings = struct.unpack(">HHH", names[:6])
+            fields: dict[int, list[tuple[bool, str]]] = {}
+            for platform, encoding, language, name_id, size, index in struct.iter_unpack(">HHHHHH", names[6 : 6 + records * 12]):
+                if name_id not in (1, 2, 16, 17):
+                    continue
+                if platform == 1 and encoding != 0:
+                    continue
+                codec = "utf-16-be" if platform in (0, 3) else "mac_roman"
+                value = names[strings + index : strings + index + size].decode(codec, errors="ignore").strip("\x00 ")
+                if value:
+                    english = (platform == 3 and language & 0x3FF == 9) or (platform == 1 and language == 0)
+                    fields.setdefault(name_id, []).append((english, value))
+            families = fields.get(16) or fields.get(1)
+            if not families:
+                continue
+            styles = fields.get(17) or fields.get(2) or [(False, "Regular")]
+            family = next((value for english, value in families if english), families[0][1])
+            style = next((value for english, value in styles if english), styles[0][1])
+            weight = 400
+            if b"OS/2" in tables:
+                stream.seek(tables[b"OS/2"][0] + 4)
+                weight = struct.unpack(">H", stream.read(2))[0] or weight
+            faces.append({
+                "family": family,
+                "aliases": sorted({value for _, value in families + fields.get(1, [])} - {family}),
+                "style": style,
+                "weight": min(1000, weight),
+            })
+    return faces
+
+
+_font_cache_lock = threading.Lock()
+_font_cache: tuple[float, list[dict[str, Any]]] = (0, [])
+
+
+def installed_fonts() -> dict[str, Any]:
+    global _font_cache
+    with _font_cache_lock:
+        checked, families = _font_cache
+        if not checked or time.monotonic() - checked > 60:
+            fonts: dict[str, dict[str, Any]] = {}
+            for directory in font_directories():
+                if not directory.is_dir():
+                    continue
+                for path in directory.rglob("*"):
+                    if path.suffix.lower() not in {".otf", ".ttf", ".ttc", ".otc"}:
+                        continue
+                    try:
+                        faces = font_faces(path)
+                    except (OSError, struct.error, ValueError):
+                        continue
+                    for face in faces:
+                        family = fonts.setdefault(face["family"], {"family": face["family"], "aliases": [], "variants": []})
+                        family["aliases"] = sorted(set(family["aliases"] + face["aliases"]))
+                        variant = {"name": face["style"], "weight": face["weight"]}
+                        if variant not in family["variants"]:
+                            family["variants"].append(variant)
+            families = sorted(fonts.values(), key=lambda family: family["family"].casefold())
+            for family in families:
+                family["variants"].sort(key=lambda variant: (variant["weight"], variant["name"]))
+            _font_cache = time.monotonic(), families
+    return {"fonts": [family["family"] for family in families], "families": families}
 
 
 class WorkbenchServer(ThreadingHTTPServer):
@@ -1519,7 +1792,14 @@ class WorkbenchServer(ThreadingHTTPServer):
         self.log_dir = Path(log_dir) if log_dir is not None else None
         self.vendor_cache = Path(vendor_cache) if vendor_cache is not None else None
         self.log_file = log_file
+        self.write_lock = threading.Lock()
         super().__init__(address, WorkbenchHandler)
+        self.batch_journal = (self.log_dir or runtime_directory()) / f"batch-{self.server_port}.json"
+        try:
+            recover_batch(self.batch_journal)
+        except Exception:
+            self.server_close()
+            raise
 
 
 class WorkbenchHandler(BaseHTTPRequestHandler):
@@ -1544,7 +1824,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         if route.startswith("/assets/"):
             route = "/assets/*"
-        elif route not in {"/", "/api/health", "/api/document", "/api/events", "/api/context", "/api/anchor", "/api/shutdown"}:
+        elif route not in {"/", "/api/health", "/api/document", "/api/events", "/api/context", "/api/anchor", "/api/shutdown", "/api/files", "/api/preview", "/api/fonts", "/api/batch", "/api/versions"}:
             route = route if route in self.server.vendor_routes else "other"
         status = int(code) if str(code).isdigit() else 0
         level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 else logging.INFO
@@ -1626,7 +1906,55 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload)
                 return
             if parsed.path == "/api/document":
-                self.send_json(200, read_document(self.query_file(query)))
+                known = query.get("revision", [""])[0]
+                with self.server.write_lock:
+                    target = self.query_file(query)
+                    raw = target.read_bytes()
+                    document = None if known == hashlib.sha256(raw).hexdigest() else read_document(target, raw)
+                if document is None:
+                    self.send_bytes(204, b"", "application/json")
+                else:
+                    self.send_json(200, document)
+                return
+            if parsed.path == "/api/versions":
+                target = self.query_file(query)
+                with self.server.write_lock:
+                    revision = query.get("revision", [None])[0]
+                    if revision is None:
+                        result = document_versions(target)
+                    else:
+                        source = version_source(target, revision)
+                        result = {"html": source, "headStart": parse_source(source)["locations"]["headStart"]}
+                self.send_json(200, result)
+                return
+            if parsed.path == "/api/files":
+                reference = normalize_file_reference(query.get("directory", [""])[0])
+                if not reference:
+                    raise WorkbenchError("INVALID_DIRECTORY", "请选择一个有效的工作目录。", 400)
+                directory = Path(reference).expanduser().resolve()
+                if not directory.is_dir():
+                    raise WorkbenchError("INVALID_DIRECTORY", "请选择一个有效的工作目录。", 400)
+                files = []
+                for candidate in sorted(item for item in directory.rglob("*") if item.suffix.lower() == ".html"):
+                    try:
+                        resolved = candidate.resolve(strict=True)
+                        relative = resolved.relative_to(directory)
+                    except (OSError, ValueError):
+                        continue
+                    if resolved.is_file():
+                        files.append({"path": str(resolved), "relativePath": relative.as_posix()})
+                self.send_json(200, {"directory": str(directory), "files": files})
+                return
+            if parsed.path == "/api/preview":
+                target = self.query_file(query)
+                source = target.read_text(encoding="utf-8")
+                base = f'<base href="{document_asset_base(target)}">'
+                head = re.search(r"<head\b[^>]*>", source, re.IGNORECASE)
+                source = source[:head.end()] + base + source[head.end():] if head else base + source
+                self.send_bytes(200, source.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if parsed.path == "/api/fonts":
+                self.send_json(200, installed_fonts())
                 return
             if parsed.path == "/api/events":
                 self.stream_events(self.query_file(query))
@@ -1648,12 +1976,18 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         try:
             parsed = urllib.parse.urlsplit(self.path)
-            if parsed.path != "/api/document":
+            if parsed.path not in {"/api/document", "/api/batch"}:
                 self.send_json(404, {"error": "NOT_FOUND", "message": "接口不存在。"})
                 return
             body = self.read_json_body()
             query = urllib.parse.parse_qs(parsed.query)
-            self.send_json(200, save_document(self.query_file(query), body))
+            with self.server.write_lock:
+                if parsed.path == "/api/batch":
+                    result = {"documents": save_batch(self.server.batch_journal, body.get("changes"))}
+                else:
+                    recover_batch(self.server.batch_journal)
+                    result = save_document(self.query_file(query), body)
+            self.send_json(200, result)
         except (BrokenPipeError, ConnectionResetError):
             return
         except json.JSONDecodeError as caught:
@@ -1671,11 +2005,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "stopping": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            if parsed.path not in {"/api/context", "/api/anchor"}:
+            if parsed.path not in {"/api/context", "/api/anchor", "/api/versions"}:
                 self.send_json(404, {"error": "NOT_FOUND", "message": "接口不存在。"})
                 return
             body = self.read_json_body()
             target = self.query_file(query)
+            if parsed.path == "/api/versions":
+                with self.server.write_lock:
+                    result = restore_version(self.server.batch_journal, target, body)
+                self.send_json(200, result)
+                return
             selections = body.get("selections")
             if parsed.path == "/api/anchor":
                 # Identity promotion mutates the file, so it is a separate,
@@ -1684,7 +2023,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     raise WorkbenchError("INVALID_ANCHOR", "请至少选择一个元素。", 400)
                 if len(selections) > MAX_CONTEXT_SELECTIONS:
                     raise WorkbenchError("INVALID_ANCHOR", f"一次最多添加 {MAX_CONTEXT_SELECTIONS} 个元素。", 400)
-                self.send_json(200, promote_identities(target, selections, str(body.get("baseRevision") or "")))
+                with self.server.write_lock:
+                    recover_batch(self.server.batch_journal)
+                    result = promote_identities(target, selections, str(body.get("baseRevision") or ""))
+                self.send_json(200, result)
                 return
             self.send_json(200, build_selection_context(target, selections))
         except (BrokenPipeError, ConnectionResetError):
@@ -1710,7 +2052,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         token = parts[2]
         source_file = resolve_html_file(decode_asset_token(token))
         relative = urllib.parse.unquote(parts[3])
-        resource = (source_file.parent / relative).resolve(strict=True)
+        if relative.startswith("~/"):
+            resource = (Path(source_file.anchor) / relative[2:]).resolve(strict=True)
+        else:
+            resource = (source_file.parent / relative).resolve(strict=True)
         content_type = mimetypes.guess_type(resource.name)[0] or "application/octet-stream"
         self.send_bytes(200, resource.read_bytes(), content_type, "private, max-age=60")
 
@@ -1724,7 +2069,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         missing = False
         while True:
             try:
-                document = read_document(target)
+                with self.server.write_lock:
+                    document = read_document(target)
                 missing = False
                 if document["revision"] != last_revision:
                     last_revision = document["revision"]
