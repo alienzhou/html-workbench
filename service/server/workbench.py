@@ -57,6 +57,7 @@ SERVICE_CAPABILITIES = (
     "workspace-batch-save",
     "workspace-board-assets",
     "local-font-families",
+    "conditional-document-read",
 )
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 SCRIPT_PATTERN = re.compile(r"^<script\b[\s\S]*</script\s*>$", re.IGNORECASE)
@@ -1437,9 +1438,9 @@ def document_asset_base(target: Path) -> str:
     return f"/assets/{encode_asset_token(target)}/~/{directories}/" if directories else f"/assets/{encode_asset_token(target)}/~/"
 
 
-def read_document(target: Path) -> dict[str, Any]:
+def read_document(target: Path, raw: bytes | None = None) -> dict[str, Any]:
     try:
-        source = target.read_bytes().decode("utf-8")
+        source = (target.read_bytes() if raw is None else raw).decode("utf-8")
     except UnicodeDecodeError as caught:
         raise WorkbenchError("INVALID_DOCUMENT", "HTML 文件必须使用 UTF-8 编码。", 400) from caught
     parsed = parse_source(source)
@@ -1841,9 +1842,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload)
                 return
             if parsed.path == "/api/document":
+                known = query.get("revision", [""])[0]
                 with self.server.write_lock:
-                    document = read_document(self.query_file(query))
-                self.send_json(200, document)
+                    target = self.query_file(query)
+                    raw = target.read_bytes()
+                    document = None if known == hashlib.sha256(raw).hexdigest() else read_document(target, raw)
+                if document is None:
+                    self.send_bytes(204, b"", "application/json")
+                else:
+                    self.send_json(200, document)
                 return
             if parsed.path == "/api/files":
                 reference = normalize_file_reference(query.get("directory", [""])[0])

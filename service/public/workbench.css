@@ -181,12 +181,25 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .canvas-area[data-panning="true"] .board-edit { pointer-events: none; }
 .token-panel { border-bottom: 1px solid var(--line); padding: 3px 8px 8px; }
 .token-create, .token-row { display: grid; gap: 4px; align-items: center; }
-.token-create { grid-template-columns: minmax(0, 1fr) 65px auto; }
+.token-create { grid-template-columns: minmax(0, 1fr) 79px auto; }
 .token-create button, .dialog-actions button:last-child { background: var(--tint); min-height: 27px; }
-.token-row { grid-template-columns: 14px minmax(0, 1fr) auto; margin-top: 7px; }
+.token-row { grid-template-columns: minmax(0, 1fr) auto; margin-top: 7px; }
 .token-row strong { grid-column: 1 / -1; overflow-wrap: anywhere; font-weight: 600; }
 .token-row button { min-height: 26px; }
-.color-swatch { width: 13px; height: 13px; border: 1px solid var(--line); border-radius: 4px; }
+.color-input { display: flex; flex: 1; align-items: center; gap: 4px; min-width: 0; }
+.color-input input { min-width: 0; width: 100%; }
+.color-input .color-swatch {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  padding: 3px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.color-swatch::-webkit-color-swatch-wrapper { padding: 0; }
+.color-swatch::-webkit-color-swatch { border: 1px solid var(--line); border-radius: 4px; }
+.color-swatch::-moz-color-swatch { border: 1px solid var(--line); border-radius: 4px; }
 .color-field { grid-column: 1 / -1; }
 .token-select { min-width: 70px; width: 105px; color: var(--ink); border: 1px solid var(--line); border-radius: 5px; background: white; font: inherit; }
 .token-dialog { width: min(460px, calc(100% - 30px)); max-height: 85vh; padding: 16px; color: inherit; border: 1px solid var(--line); border-radius: 10px; }

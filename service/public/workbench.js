@@ -40,6 +40,7 @@ let browsing = false
 let polling = false
 let draggingCanvas = false
 let toastTimer
+let viewSaveTimer
 let view = layout.view || { x: 32, y: 64, scale: 1 }
 
 function readLayout() {
@@ -53,6 +54,7 @@ function readLayout() {
 }
 
 function rememberLayout() {
+  clearTimeout(viewSaveTimer)
   layout.files = [...boards.values()].map(({ file, label }) => ({ path: file, relativePath: label }))
   layout.boards = Object.fromEntries([...boards.values()].map(({ file, x, y, width }) => [file, { x, y, width }]))
   layout.view = view
@@ -139,6 +141,7 @@ function notify(message, error = false) {
 
 async function request(route, options) {
   const response = await fetch(route, options)
+  if (response.status === 204) return null
   const result = await response.json()
   if (!response.ok) {
     const error = new Error(result.message || result.error)
@@ -204,6 +207,40 @@ function transform() {
   qs('#fit-button').textContent = `${Math.round(view.scale * 100)}%`
 }
 
+// Keep a reachable edge of at least one board inside the viewport.
+function keepBoardInView() {
+  const width = canvas.clientWidth
+  const height = canvas.clientHeight
+  if (!width || !height || !boards.size) return
+  let nearest
+  let distance = Infinity
+  for (const board of boards.values()) {
+    const left = board.x * view.scale
+    const top = board.y * view.scale
+    const boardWidth = board.width * view.scale
+    const boardHeight = ((mode === 'preview' ? board.previewHeight ?? board.height : board.height) + 30) * view.scale
+    const insetX = Math.min(40, width / 2, boardWidth)
+    const insetY = Math.min(40, height / 2, boardHeight)
+    const x = Math.max(insetX - left - boardWidth, Math.min(view.x, width - insetX - left))
+    const y = Math.max(insetY - top - boardHeight, Math.min(view.y, height - insetY - top))
+    if (x === view.x && y === view.y) return
+    const offset = Math.hypot(x - view.x, y - view.y)
+    if (offset < distance) {
+      distance = offset
+      nearest = { x, y }
+    }
+  }
+  if (nearest) view = { ...view, ...nearest }
+}
+
+function moveView(next) {
+  view = next
+  keepBoardInView()
+  transform()
+  clearTimeout(viewSaveTimer)
+  viewSaveTimer = setTimeout(rememberLayout, 180)
+}
+
 function boardGeometry(board) {
   Object.assign(board.card.style, { left: `${board.x}px`, top: `${board.y}px`, width: `${board.width}px` })
 }
@@ -224,6 +261,14 @@ function fitBounds(items) {
   rememberLayout()
 }
 
+function focusBoard(board = active) {
+  if (!board) return
+  const scale = Math.min(1, Math.max(.04, (canvas.clientWidth - 64) / board.width))
+  view = { x: (canvas.clientWidth - board.width * scale) / 2 - board.x * scale, y: 32 - board.y * scale, scale }
+  transform()
+  rememberLayout()
+}
+
 function focusSelection() {
   const bounds = [...selection].flatMap((node) => {
     const board = owner(node)
@@ -233,7 +278,7 @@ function focusSelection() {
     return [{ left: board.x + rect.left, right: board.x + rect.right, top: board.y + origin + rect.top, bottom: board.y + origin + rect.bottom }]
   })
   if (bounds.length) fitBounds(bounds)
-  else if (active) fit([active])
+  else focusBoard()
 }
 
 function pointerDrag(target, event, move, end) {
@@ -412,9 +457,7 @@ function setBoardHeight(board, height, preview = false) {
 }
 
 function panCanvas(dx, dy) {
-  view = { ...view, x: view.x - dx, y: view.y - dy }
-  transform()
-  rememberLayout()
+  moveView({ ...view, x: view.x - dx, y: view.y - dy })
 }
 
 async function paint(board, source, locations) {
@@ -477,13 +520,20 @@ function makeBoard(data, label, background = false) {
   title.append(remove)
   title.addEventListener('pointerdown', (event) => {
     if (remove.contains(event.target) || event.button !== 0 || spaceDown) return
-    activate(board)
+    if (active !== board) {
+      activate(board)
+      renderLayers()
+    }
     const { x, y } = board
     pointerDrag(title, event, (dx, dy) => {
       board.x = x + dx / view.scale
       board.y = y + dy / view.scale
       boardGeometry(board)
-    }, rememberLayout)
+    }, () => {
+      keepBoardInView()
+      transform()
+      rememberLayout()
+    })
   })
   board.surface = element('div', 'board-surface')
   board.frame = element('iframe', 'board-edit')
@@ -530,7 +580,8 @@ async function openFiles(files, preferred) {
         const restored = backgroundBoards.get(data.filePath)
         backgroundBoards.delete(data.filePath)
         restored.card.hidden = false
-        restored.heightTracker?.schedule()
+        if (mode === 'preview') previewBoard(restored)
+        else restored.heightTracker?.schedule()
         const last = Math.max(0, ...[...boards.values()].map((item) => item.x + item.width + 72))
         restored.x = last
         boardGeometry(restored)
@@ -556,6 +607,8 @@ async function openFiles(files, preferred) {
       renderTokens()
       if (first && !layout.view) fit()
       else if (!first && opened.length > 1) fit()
+      else if (preferred && active?.file === preferred && (!first || !layout.boards?.[preferred])) focusBoard()
+      keepBoardInView()
       transform()
       rememberLayout()
     }
@@ -573,10 +626,13 @@ async function removeBoard(board) {
     if (board.current !== board.disk) return
   }
   for (const node of selection) if (node.ownerDocument === board.doc) selection.delete(node)
+  stopPreview(board)
   board.card.hidden = true
   boards.delete(board.file)
   backgroundBoards.set(board.file, board)
   if (active === board) activate(boards.values().next().value)
+  keepBoardInView()
+  transform()
   rememberLayout()
   updateSelection()
 }
@@ -948,7 +1004,7 @@ function connectFrame(board) {
     const target = event.target.closest?.('svg') || event.target
     setHover(target?.matches?.('html,body') ? null : target)
   })
-  board.frame.addEventListener('pointerleave', () => { if (hover?.ownerDocument === doc) setHover(null) })
+  board.frame.onpointerleave = () => { if (hover?.ownerDocument === doc) setHover(null) }
   doc.documentElement.addEventListener('pointerleave', () => { if (hover?.ownerDocument === doc) setHover(null) })
   doc.addEventListener('click', (event) => {
     if (editingText?.contains(event.target)) return
@@ -1003,7 +1059,8 @@ function renderLayers() {
     const root = element('section', 'layer-board')
     const title = button(board.label, () => {
       activate(board)
-      fit([board])
+      focusBoard(board)
+      renderLayers()
     }, 'layer-board-title')
     title.addEventListener('dragover', (event) => { if (movingLayer) event.preventDefault() })
     title.addEventListener('drop', (event) => {
@@ -1012,7 +1069,7 @@ function renderLayers() {
       movingLayer = null
     })
     root.append(title)
-    if (board.doc) {
+    if (board.doc && (board === active || term || [...selection].some((node) => node.ownerDocument === board.doc))) {
       for (const node of children(board.doc.body)) {
         const branch = layerBranch(node, 0, term)
         if (branch) root.append(branch)
@@ -1454,6 +1511,30 @@ function rgbaChannels(value) {
   return color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)$/)?.slice(1).map((item) => Number(item ?? 1))
 }
 
+function colorInput(input, label, fallback = '#000000') {
+  const group = element('div', 'color-input')
+  const picker = element('input', 'color-swatch')
+  picker.type = 'color'
+  picker.title = '选择' + label
+  picker.setAttribute('aria-label', picker.title)
+  const channels = () => rgbaChannels(input.value) || rgbaChannels(fallback) || [0, 0, 0, 1]
+  const syncPicker = () => {
+    picker.value = '#' + channels().slice(0, 3).map((channel) => channel.toString(16).padStart(2, '0')).join('')
+  }
+  syncPicker()
+  input.addEventListener('input', syncPicker)
+  picker.addEventListener('change', () => {
+    const opacity = channels()[3]
+    const value = opacity > 0 && opacity < 1
+      ? 'rgba(' + [...rgbaChannels(picker.value).slice(0, 3), opacity].join(', ') + ')'
+      : picker.value
+    input.value = value
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  group.append(picker, input)
+  return group
+}
+
 function tokenFor(value) {
   const key = value?.match(/^var\(\s*(--wb-color-[\w-]+)/)?.[1]
   return tokenList().find((token) => token.key === key)
@@ -1598,7 +1679,7 @@ function renderTokens() {
   color.value = '#087c61'
   color.setAttribute('aria-label', '新 Token 色值')
   const add = element('button', '', '新建')
-  create.append(name, color, add)
+  create.append(name, colorInput(color, '新 Token 颜色'), add)
   create.onsubmit = (event) => {
     event.preventDefault()
     const value = plainColor(color.value)
@@ -1613,8 +1694,6 @@ function renderTokens() {
   for (const token of tokenList()) {
     const row = element('div', 'token-row')
     const title = element('strong', '', token.name)
-    const swatch = element('span', 'color-swatch')
-    swatch.style.background = token.value
     const value = element('input')
     value.value = token.value
     value.setAttribute('aria-label', token.name + ' 色值')
@@ -1622,7 +1701,7 @@ function renderTokens() {
     value.onkeydown = (event) => { if (event.key === 'Enter') value.blur() }
     const usage = button('查看用量', () => pickColorUsages(token))
     usage.setAttribute('aria-label', token.name + ' 查看用量')
-    row.append(title, swatch, value, usage)
+    row.append(title, colorInput(value, token.name + '颜色'), usage)
     panel.append(row)
   }
 }
@@ -1826,7 +1905,9 @@ function renderEffects(nodes) {
       }
       const opacity = element('label', 'design-field')
       opacity.append(element('span', '', '透明度 %'), alpha)
-      panel.append(type, grid, color, opacity)
+      const computed = nodes[0].ownerDocument.defaultView.getComputedStyle(nodes[0])
+      const fallback = tokenFor(color.value)?.value || computed.color
+      panel.append(type, grid, colorInput(color, '阴影颜色', fallback), opacity)
       if (tokenList().length) {
         const usages = nodes.map((node) => ({ node, shadow: index, color: shadowColor(row.value) }))
         panel.append(tokenMenu('阴影颜色', usages, color.value))
@@ -1973,7 +2054,8 @@ function renderInspectorFields() {
     }
     const grid = element('div', 'design-grid')
     for (const [property, label] of fields) {
-      const field = element('label', 'design-field')
+      const isColor = colorFields.some(([key]) => key === property)
+      const field = isColor ? element('div', 'design-field color-field') : element('label', 'design-field')
       const input = element('input')
       input.value = commonValue(selected, property)
       input.placeholder = '混合'
@@ -1985,14 +2067,15 @@ function renderInspectorFields() {
         applyStyle(property, value)
       })
       input.addEventListener('keydown', (event) => { if (event.key === 'Enter') input.blur() })
-      field.append(element('span', '', label), input)
-      if (colorFields.some(([key]) => key === property)) {
-        field.classList.add('color-field')
+      field.append(element('span', '', label))
+      if (isColor) {
+        const fallback = first.ownerDocument.defaultView.getComputedStyle(first).getPropertyValue(property)
+        field.append(colorInput(input, label, fallback))
         if (tokenList().length) {
           const usages = selected.map((node) => ({ node, property }))
           field.append(tokenMenu(label, usages, input.value))
         }
-      }
+      } else field.append(input)
       grid.append(field)
     }
     group.append(grid)
@@ -2065,11 +2148,29 @@ window.addEventListener('message', ({ source, data }) => {
   if (data.kind === 'height') setBoardHeight(board, data.height, true)
   if (data.kind === 'pan' && Number.isFinite(data.x) && Number.isFinite(data.y)) panCanvas(data.x, data.y)
   if (data.kind === 'anchor' && Number.isFinite(data.top)) {
-    view = { ...view, y: 24 - (board.y + board.surface.offsetTop + data.top) * view.scale }
-    transform()
-    rememberLayout()
+    moveView({ ...view, y: 24 - (board.y + board.surface.offsetTop + data.top) * view.scale })
   }
 })
+
+const previewObserver = new IntersectionObserver((entries) => {
+  if (mode !== 'preview') return
+  for (const { target, isIntersecting } of entries) {
+    if (!isIntersecting) continue
+    const board = boards.get(target.dataset.file)
+    previewObserver.unobserve(target)
+    if (board?.card === target) loadPreview(board)
+  }
+}, { root: canvas })
+
+function loadPreview(board) {
+  board.previewHeight = undefined
+  board.preview.srcdoc = frameSource(board, board.current) + previewBridge
+}
+
+function stopPreview(board) {
+  previewObserver.unobserve(board.card)
+  board.preview.removeAttribute('srcdoc')
+}
 
 function previewBoard(board) {
   board.preview.hidden = mode !== 'preview'
@@ -2077,10 +2178,10 @@ function previewBoard(board) {
   board.overlay.hidden = mode === 'preview'
   board.surface.style.height = board.height + 'px'
   if (mode === 'preview') {
-    board.previewHeight = undefined
-    board.preview.srcdoc = frameSource(board, board.current) + previewBridge
+    if (board === active || board.preview.hasAttribute('srcdoc')) loadPreview(board)
+    else previewObserver.observe(board.card)
   } else {
-    board.preview.removeAttribute('srcdoc')
+    stopPreview(board)
     board.heightTracker?.schedule()
   }
 }
@@ -2155,11 +2256,16 @@ async function browseDirectory() {
         rememberLayout()
         for (const board of [...boards.values()]) {
           if (!result.files.some((file) => file.path === board.file)) {
+            stopPreview(board)
+            board.heightTracker?.disconnect()
             board.card.remove()
             boards.delete(board.file)
           }
         }
-        backgroundBoards.forEach((board) => board.card.remove())
+        backgroundBoards.forEach((board) => {
+          board.heightTracker?.disconnect()
+          board.card.remove()
+        })
         backgroundBoards.clear()
         selection.clear()
         undoStack.length = 0
@@ -2184,9 +2290,7 @@ function zoomAt(x, y, delta) {
   const point = { x: x - rect.left, y: y - rect.top }
   const scale = Math.max(.04, Math.min(4, view.scale * Math.exp(-delta * .005)))
   const ratio = scale / view.scale
-  view = { x: point.x - (point.x - view.x) * ratio, y: point.y - (point.y - view.y) * ratio, scale }
-  transform()
-  rememberLayout()
+  moveView({ x: point.x - (point.x - view.x) * ratio, y: point.y - (point.y - view.y) * ratio, scale })
 }
 
 function bindCanvas() {
@@ -2203,7 +2307,7 @@ function bindCanvas() {
     if (spaceDown || event.button === 1) {
       event.preventDefault()
       const { x, y } = view
-      pointerDrag(canvas, event, (dx, dy) => { view = { ...view, x: x + dx, y: y + dy }; transform() }, rememberLayout)
+      pointerDrag(canvas, event, (dx, dy) => moveView({ ...view, x: x + dx, y: y + dy }), rememberLayout)
       return
     }
     if (event.button || mode !== 'edit' || event.target.closest('.board-card')) return
@@ -2242,13 +2346,13 @@ function bindCanvas() {
 }
 
 async function keepFilesInSync() {
-  if (writing || restoring || browsing || polling || draggingCanvas || !boards.size) return
+  if (document.hidden || writing || restoring || browsing || polling || draggingCanvas || !boards.size) return
   polling = true
   await Promise.all([...boards.values()].map(async (board) => {
     try {
       const known = board.revision
-      const data = await request(documentRoute(board.file))
-      if (writing || restoring || browsing || draggingCanvas || !boards.has(board.file) || board.revision !== known || data.revision === known) return
+      const data = await request(documentRoute(board.file) + `&revision=${encodeURIComponent(known)}`)
+      if (!data || writing || restoring || browsing || draggingCanvas || boards.get(board.file) !== board || board.revision !== known || data.revision === known) return
       if (board.current !== board.disk || editingText?.ownerDocument === board.doc) {
         board.conflict = true
         updateSaveStatus()
@@ -2330,6 +2434,7 @@ function bindControls() {
     }
   }
   for (const control of document.querySelectorAll('.mode-button')) control.onclick = () => {
+    if (mode === control.dataset.mode) return
     mode = control.dataset.mode
     setHover(null)
     setMeasuring(false)
@@ -2351,6 +2456,7 @@ function bindControls() {
     activate(active)
     rememberLayout()
   }
+  qs('#focus-board-button').onclick = () => focusBoard()
   qs('#fit-button').onclick = () => fit()
   qs('#fit-button').title = '适应全部画板（Shift+1）'
   qs('#save-button').onclick = save
@@ -2395,6 +2501,10 @@ function bindControls() {
 
 bindControls()
 bindCanvas()
+new ResizeObserver(() => {
+  keepBoardInView()
+  transform()
+}).observe(canvas)
 setPanels(narrow.matches ? '' : 'layers', !narrow.matches)
 renderInspector()
 const initial = params.get('file')
