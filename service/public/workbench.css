@@ -160,7 +160,7 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 }
 @media (max-width: 680px) {
   .workbench.left-panel-open, .workbench.inspector-open { --left: 0px; --right: 0px; }
-  .toolbar-cluster [data-width], .save-button span, .product-mark, #replace-image-button { display: none; }
+  .toolbar-cluster [data-width]:not([data-width="full"]), .save-button span, .product-mark, #replace-image-button { display: none; }
   .control-panel, .inspector-panel { box-shadow: var(--shadow); max-width: 65%; }
   .tool-rail span { display: none; }
 }
@@ -202,9 +202,14 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .color-swatch::-moz-color-swatch { border: 1px solid var(--line); border-radius: 4px; }
 .color-field { grid-column: 1 / -1; }
 .token-select { min-width: 70px; width: 105px; color: var(--ink); border: 1px solid var(--line); border-radius: 5px; background: white; font: inherit; }
-.token-dialog { width: min(460px, calc(100% - 30px)); max-height: 85vh; padding: 16px; color: inherit; border: 1px solid var(--line); border-radius: 10px; }
-.token-dialog::backdrop { background: #17312d50; }
-.token-dialog h2 { font-size: 15px; margin: 0; }
+:is(.token-dialog, .version-dialog) { width: min(460px, calc(100% - 30px)); max-height: 85vh; padding: 16px; color: inherit; border: 1px solid var(--line); border-radius: 10px; }
+:is(.token-dialog, .version-dialog)::backdrop { background: #17312d50; }
+:is(.token-dialog, .version-dialog) h2 { font-size: 15px; margin: 0; }
+.version-dialog p { margin: 6px 0; color: var(--muted); overflow-wrap: anywhere; }
+.version-list { max-height: 28vh; overflow: auto; }
+.version-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 34px; border-bottom: 1px solid var(--line); }
+.version-row span { color: var(--muted); }
+.version-preview { display: block; width: 100%; height: min(36vh, 320px); border: 1px solid var(--line); margin-top: 8px; }
 .usage-list { max-height: 50vh; overflow: auto; }
 .usage-list label { display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 1px solid var(--line); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }

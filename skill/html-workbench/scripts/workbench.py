@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bisect
+import gzip
 import hashlib
 import html
 import io
@@ -58,6 +59,7 @@ SERVICE_CAPABILITIES = (
     "workspace-board-assets",
     "local-font-families",
     "conditional-document-read",
+    "document-version-history",
 )
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 SCRIPT_PATTERN = re.compile(r"^<script\b[\s\S]*</script\s*>$", re.IGNORECASE)
@@ -1237,12 +1239,12 @@ def promote_identities(target: Path, descriptors: list[dict[str, Any]], base_rev
     return {"revision": revision_of(updated), "assigned": assigned, "changed": True}
 
 
-def write_atomic(target: Path, content: str) -> None:
+def write_atomic(target: Path, content: str | bytes) -> None:
     temporary_name: Path | None = None
     try:
         descriptor, temporary_name = make_temp_file(target.parent, prefix=f".{target.name}.workbench-", suffix=".tmp")
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
-            output.write(content)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content.encode("utf-8") if isinstance(content, str) else content)
             output.flush()
             os.fsync(output.fileno())
         if target.exists():
@@ -1494,12 +1496,67 @@ def prepare_document(current: dict[str, Any], body: dict[str, Any]) -> str:
     return source
 
 
+def versions_directory(target: Path) -> Path:
+    return target.parent / RUNTIME_DIR_NAME / "versions" / revision_of(target.name)
+
+
+def archive_version(target: Path, source: str, revision: str, mtime_ms: float) -> None:
+    directory = versions_directory(target)
+    snapshot = directory / (revision + ".gz")
+    if snapshot.exists():
+        return
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    self_ignore(directory)
+    write_atomic(snapshot, gzip.compress(source.encode("utf-8"), compresslevel=3, mtime=0))
+    os.utime(snapshot, (mtime_ms / 1000, mtime_ms / 1000))
+    sync_directory(directory)
+
+
+def document_versions(target: Path) -> dict[str, Any]:
+    current = read_document(target)
+    versions = []
+    for snapshot in versions_directory(target).glob("*.gz"):
+        revision = snapshot.stem
+        if revision == current["revision"] or not re.fullmatch(r"[a-f0-9]{64}", revision):
+            continue
+        versions.append({"revision": revision, "mtimeMs": snapshot.stat().st_mtime * 1000})
+    versions.sort(key=lambda item: item["mtimeMs"], reverse=True)
+    return {
+        "current": {"revision": current["revision"], "mtimeMs": current["mtimeMs"]},
+        "versions": versions,
+    }
+
+
+def version_source(target: Path, revision: Any) -> str:
+    if not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{64}", revision):
+        raise WorkbenchError("INVALID_VERSION", "无效的历史版本。", 400)
+    try:
+        source = gzip.decompress((versions_directory(target) / (revision + ".gz")).read_bytes()).decode("utf-8")
+    except FileNotFoundError as caught:
+        raise WorkbenchError("VERSION_NOT_FOUND", "找不到这个历史版本。", 404) from caught
+    if revision_of(source) != revision:
+        raise WorkbenchError("INVALID_VERSION", "历史版本校验失败。", 409)
+    return source
+
+
+def restore_version(journal: Path, target: Path, body: dict[str, Any]) -> dict[str, Any]:
+    return save_batch(journal, [{
+        "file": str(target),
+        "baseRevision": body.get("baseRevision"),
+        "html": version_source(target, body.get("revision")),
+    }])[0]
+
+
 def save_document(target: Path, body: dict[str, Any]) -> dict[str, Any]:
     source = prepare_document(read_document(target), body)
     latest = read_document(target)
     if latest["revision"] != body["baseRevision"]:
         raise WorkbenchError("REVISION_CONFLICT", "保存期间文件发生外部修改，未覆盖最新版。", 409, document=latest)
-    write_atomic(target, source)
+    if latest["html"] != source:
+        archive_version(target, latest["html"], latest["revision"], latest["mtimeMs"])
+        if target.read_bytes() != latest["html"].encode("utf-8"):
+            raise WorkbenchError("REVISION_CONFLICT", "保存期间文件发生外部修改，未覆盖最新版。", 409)
+        write_atomic(target, source)
     return read_document(target)
 
 
@@ -1543,6 +1600,7 @@ def save_batch(journal: Path, changes: Any) -> list[dict[str, Any]]:
         raise WorkbenchError("INVALID_SAVE", "请选择 1 至 128 个待保存文件。", 400)
     recover_batch(journal)
     prepared: dict[Path, tuple[str, str]] = {}
+    baselines: dict[Path, tuple[str, float]] = {}
     for change in changes:
         if not isinstance(change, dict) or not isinstance(change.get("file"), str):
             raise WorkbenchError("INVALID_SAVE", "每项修改须指定文件路径。", 400)
@@ -1561,6 +1619,7 @@ def save_batch(journal: Path, changes: Any) -> list[dict[str, Any]]:
         else:
             after = prepare_document(current, change)
         prepared[target] = (before, after)
+        baselines[target] = (current["revision"], current["mtimeMs"])
 
     entries = [
         {"file": str(target), "before": before, "afterHash": sha256_bytes(after.encode("utf-8"))}
@@ -1568,6 +1627,11 @@ def save_batch(journal: Path, changes: Any) -> list[dict[str, Any]]:
     ]
     if not entries:
         return [read_document(target) for target in prepared]
+
+    for target, (before, after) in prepared.items():
+        if before != after:
+            revision, mtime_ms = baselines[target]
+            archive_version(target, before, revision, mtime_ms)
 
     journal.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(journal, json.dumps(entries, ensure_ascii=False))
@@ -1760,7 +1824,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         if route.startswith("/assets/"):
             route = "/assets/*"
-        elif route not in {"/", "/api/health", "/api/document", "/api/events", "/api/context", "/api/anchor", "/api/shutdown", "/api/files", "/api/preview", "/api/fonts", "/api/batch"}:
+        elif route not in {"/", "/api/health", "/api/document", "/api/events", "/api/context", "/api/anchor", "/api/shutdown", "/api/files", "/api/preview", "/api/fonts", "/api/batch", "/api/versions"}:
             route = route if route in self.server.vendor_routes else "other"
         status = int(code) if str(code).isdigit() else 0
         level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 else logging.INFO
@@ -1852,6 +1916,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_json(200, document)
                 return
+            if parsed.path == "/api/versions":
+                target = self.query_file(query)
+                with self.server.write_lock:
+                    revision = query.get("revision", [None])[0]
+                    if revision is None:
+                        result = document_versions(target)
+                    else:
+                        source = version_source(target, revision)
+                        result = {"html": source, "headStart": parse_source(source)["locations"]["headStart"]}
+                self.send_json(200, result)
+                return
             if parsed.path == "/api/files":
                 reference = normalize_file_reference(query.get("directory", [""])[0])
                 if not reference:
@@ -1930,11 +2005,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "stopping": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            if parsed.path not in {"/api/context", "/api/anchor"}:
+            if parsed.path not in {"/api/context", "/api/anchor", "/api/versions"}:
                 self.send_json(404, {"error": "NOT_FOUND", "message": "接口不存在。"})
                 return
             body = self.read_json_body()
             target = self.query_file(query)
+            if parsed.path == "/api/versions":
+                with self.server.write_lock:
+                    result = restore_version(self.server.batch_journal, target, body)
+                self.send_json(200, result)
+                return
             selections = body.get("selections")
             if parsed.path == "/api/anchor":
                 # Identity promotion mutates the file, so it is a separate,

@@ -41,6 +41,7 @@ let polling = false
 let draggingCanvas = false
 let toastTimer
 let viewSaveTimer
+let viewBeforeFullPreview
 let view = layout.view || { x: 32, y: 64, scale: 1 }
 
 function readLayout() {
@@ -56,8 +57,8 @@ function readLayout() {
 function rememberLayout() {
   clearTimeout(viewSaveTimer)
   layout.files = [...boards.values()].map(({ file, label }) => ({ path: file, relativePath: label }))
-  layout.boards = Object.fromEntries([...boards.values()].map(({ file, x, y, width }) => [file, { x, y, width }]))
-  layout.view = view
+  layout.boards = Object.fromEntries([...boards.values()].map(({ file, x, y, width, fullWidth }) => [file, { x, y, width: fullWidth ? 'full' : width }]))
+  layout.view = viewBeforeFullPreview || view
   layout.version = 2
   localStorage.setItem(`html-workbench:${directory}`, JSON.stringify(layout))
 }
@@ -191,7 +192,9 @@ function activate(board) {
   qs('#file-name').textContent = board?.label || '未打开文件'
   qs('#file-input').value = board?.file || ''
   for (const control of document.querySelectorAll('[data-width]')) {
-    control.classList.toggle('active', Number(control.dataset.width) === board?.width)
+    const selected = control.dataset.width === (board?.fullWidth ? 'full' : String(board?.width))
+    control.classList.toggle('active', selected)
+    control.setAttribute('aria-pressed', String(selected))
   }
   const url = new URL(location.href)
   if (board) url.searchParams.set('file', board.file)
@@ -263,8 +266,9 @@ function fitBounds(items) {
 
 function focusBoard(board = active) {
   if (!board) return
-  const scale = Math.min(1, Math.max(.04, (canvas.clientWidth - 64) / board.width))
-  view = { x: (canvas.clientWidth - board.width * scale) / 2 - board.x * scale, y: 32 - board.y * scale, scale }
+  const scale = board.fullWidth ? 1 : Math.min(1, Math.max(.04, (canvas.clientWidth - 64) / board.width))
+  const top = board.fullWidth && mode === 'preview' ? 0 : 32
+  view = { x: (canvas.clientWidth - board.width * scale) / 2 - board.x * scale, y: top - board.y * scale, scale }
   transform()
   rememberLayout()
 }
@@ -506,7 +510,9 @@ function makeBoard(data, label, background = false) {
     file: data.filePath, label: label || data.fileName, revision: data.revision,
     disk: data.html, current: data.html, locations: data.locations, assetBase: data.assetBase,
     x: position?.x ?? Math.max(0, ...[...boards.values()].map((item) => item.x + item.width + 72)),
-    y: position?.y ?? 0, width: position?.width ?? 768, height: 660,
+    y: position?.y ?? 0,
+    width: position?.width === 'full' ? canvas.clientWidth || 768 : position?.width ?? 768,
+    fullWidth: position?.width === 'full', height: 660,
   }
   board.card = element('article', 'board-card')
   board.card.dataset.file = board.file
@@ -584,6 +590,7 @@ async function openFiles(files, preferred) {
         else restored.heightTracker?.schedule()
         const last = Math.max(0, ...[...boards.values()].map((item) => item.x + item.width + 72))
         restored.x = last
+        if (restored.fullWidth) restored.width = canvas.clientWidth || restored.width
         boardGeometry(restored)
         boards.set(restored.file, restored)
         return restored
@@ -1451,6 +1458,91 @@ async function save() {
   }
 }
 
+async function showVersions() {
+  const board = active
+  if (!board || restoring) return
+  await save()
+  if (active !== board || mode !== 'edit' || qs('.version-dialog')) return
+  const route = '/api/versions?file=' + encodeURIComponent(board.file)
+  const dialog = element('dialog', 'version-dialog')
+  const list = element('div', 'version-list')
+  const preview = element('iframe', 'version-preview')
+  preview.title = '历史版本预览'
+  preview.setAttribute('sandbox', '')
+  preview.hidden = true
+  let previewRevision
+  const actions = element('div', 'dialog-actions')
+  actions.append(button('关闭', () => dialog.close()))
+  const title = element('h2', '', '历史版本')
+  title.id = 'version-dialog-title'
+  dialog.setAttribute('aria-labelledby', title.id)
+  dialog.append(title, element('p', '', board.label), list, preview, actions)
+  dialog.addEventListener('close', () => dialog.remove(), { once: true })
+  document.body.append(dialog)
+  dialog.showModal()
+  list.textContent = '正在读取版本…'
+
+  const load = async () => {
+    const { current, versions } = await request(route)
+    const format = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'medium' })
+    list.replaceChildren()
+    for (const version of [current, ...versions]) {
+      const row = element('div', 'version-row')
+      const date = new Date(version.mtimeMs)
+      const time = element('time', '', format.format(date))
+      time.dateTime = date.toISOString()
+      row.append(time)
+      if (version === current) row.append(element('span', '', '当前'))
+      else {
+        const tools = element('div')
+        tools.append(button('查看', () => viewVersion(version.revision)), button('恢复', () => restore(version, current.revision)))
+        row.append(tools)
+      }
+      list.append(row)
+    }
+    if (!versions.length) list.append(element('p', '', '暂无较早版本'))
+  }
+
+  const viewVersion = async (revision) => {
+    previewRevision = revision
+    try {
+      const { html, headStart } = await request(route + '&revision=' + revision)
+      if (!dialog.open || previewRevision !== revision) return
+      preview.srcdoc = frameSource({ assetBase: board.assetBase, headStart: indexOffset(html, headStart ?? 0) }, html)
+      preview.hidden = false
+    } catch (error) { notify(error.message, true) }
+  }
+
+  const restore = async (version, baseRevision) => {
+    if (restoring || writing || boards.get(board.file) !== board) return
+    if (board.current !== board.disk) return notify('请先保存当前编辑，再恢复历史版本。', true)
+    restoring = true
+    try {
+      const data = await request(route, jsonRequest('POST', { revision: version.revision, baseRevision }))
+      clearDocumentHistory(board)
+      selection.clear()
+      setHover(null)
+      board.revision = data.revision
+      board.disk = board.current = data.html
+      board.conflict = false
+      await paint(board, data.html, data.locations)
+      rememberDraft(board)
+      updateSelection()
+      updateSaveStatus()
+      dialog.close()
+      notify('已恢复此版本')
+    } catch (error) {
+      if (error.code === 'REVISION_CONFLICT') {
+        list.textContent = '磁盘版本已更新，请关闭后重新打开历史版本。'
+      } else notify(error.message, true)
+    } finally {
+      restoring = false
+    }
+  }
+
+  try { await load() } catch (error) { list.textContent = error.message }
+}
+
 const colorFields = [
   ['background-color', '填充颜色'],
   ['color', '文字颜色'],
@@ -2116,14 +2208,23 @@ function publishContext(packet) {
   else navigator.clipboard?.writeText(packet.markdown).catch(() => {})
 }
 
-const previewBridge = `<script>
+let previewGeneration = 0
+
+const previewBridge = (id, fixedViewport) => `<script>
 (() => {
-const send = (kind, data) => parent.postMessage({ type: 'html-workbench:preview', kind, ...data }, '*')
+const id = ${id}
+const send = (kind, data) => parent.postMessage({ type: 'html-workbench:preview', id, kind, ...data }, '*')
+let scrollInside = ${fixedViewport}
+window.addEventListener('message', ({ source, data }) => {
+  if (source !== parent || data?.type !== 'html-workbench:preview-scroll' || data.id !== id) return
+  scrollInside = true
+  heightTracker?.disconnect()
+})
 ;${trackPageHeight.toString()}
 ;${canScrollInside.toString()}
-trackPageHeight(document, (height) => send('height', { height }))
+const heightTracker = scrollInside ? null : trackPageHeight(document, (height) => send('height', { height, viewport: innerHeight, width: innerWidth }))
 document.addEventListener('wheel', (event) => {
-  if (canScrollInside(event)) return
+  if (scrollInside || canScrollInside(event)) return
   event.preventDefault()
   send('pan', { x: event.deltaX, y: event.deltaY })
 }, { passive: false })
@@ -2135,17 +2236,38 @@ document.addEventListener('click', (event) => {
   const target = document.getElementById(id)
   if (target) {
     event.preventDefault()
-    send('anchor', { top: target.getBoundingClientRect().top + scrollY })
+    if (scrollInside) target.scrollIntoView()
+    else send('anchor', { top: target.getBoundingClientRect().top + scrollY })
   }
 })
 })()
 </script>`
 
+function resizePreview(board, { height, viewport, width }) {
+  const state = board.previewState
+  if (state.scrollInside || !Number.isFinite(height) || height < 1) return
+  const now = performance.now()
+  // Detect a chain where each iframe resize immediately changes the page height again.
+  const followsResize = state.width === width && state.viewport !== viewport &&
+    Math.abs(viewport - board.previewHeight) <= 1 && now - state.time < 500
+  state.steps = followsResize ? state.steps + 1 : 0
+  Object.assign(state, { width, viewport, time: now })
+  if (state.steps >= 4) {
+    state.scrollInside = true
+    board.preview.contentWindow.postMessage({ type: 'html-workbench:preview-scroll', id: state.id }, '*')
+    setBoardHeight(board, 660, true)
+    keepBoardInView()
+    transform()
+    return
+  }
+  setBoardHeight(board, height, true)
+}
+
 window.addEventListener('message', ({ source, data }) => {
   if (mode !== 'preview' || data?.type !== 'html-workbench:preview') return
   const board = [...boards.values()].find((item) => item.preview.contentWindow === source)
-  if (!board) return
-  if (data.kind === 'height') setBoardHeight(board, data.height, true)
+  if (!board?.previewState || board.previewState.id !== data.id) return
+  if (data.kind === 'height') resizePreview(board, data)
   if (data.kind === 'pan' && Number.isFinite(data.x) && Number.isFinite(data.y)) panCanvas(data.x, data.y)
   if (data.kind === 'anchor' && Number.isFinite(data.top)) {
     moveView({ ...view, y: 24 - (board.y + board.surface.offsetTop + data.top) * view.scale })
@@ -2162,13 +2284,26 @@ const previewObserver = new IntersectionObserver((entries) => {
   }
 }, { root: canvas })
 
+function sizeFullscreenBoard(board) {
+  const width = canvas.clientWidth
+  if (width && board.width !== width) {
+    board.width = width
+    boardGeometry(board)
+    board.heightTracker?.schedule()
+  }
+  if (mode === 'preview' && canvas.clientHeight) {
+    setBoardHeight(board, Math.max(1, canvas.clientHeight - board.surface.offsetTop), true)
+  }
+}
+
 function loadPreview(board) {
-  board.previewHeight = undefined
-  board.preview.srcdoc = frameSource(board, board.current) + previewBridge
+  board.previewState = { id: ++previewGeneration, steps: 0, scrollInside: board.fullWidth }
+  board.preview.srcdoc = frameSource(board, board.current) + previewBridge(board.previewState.id, board.fullWidth)
 }
 
 function stopPreview(board) {
   previewObserver.unobserve(board.card)
+  board.previewState = undefined
   board.preview.removeAttribute('srcdoc')
 }
 
@@ -2176,7 +2311,9 @@ function previewBoard(board) {
   board.preview.hidden = mode !== 'preview'
   board.frame.hidden = mode === 'preview'
   board.overlay.hidden = mode === 'preview'
+  board.previewHeight = undefined
   board.surface.style.height = board.height + 'px'
+  if (board.fullWidth) sizeFullscreenBoard(board)
   if (mode === 'preview') {
     if (board === active || board.preview.hasAttribute('srcdoc')) loadPreview(board)
     else previewObserver.observe(board.card)
@@ -2376,11 +2513,14 @@ const blockContainers = 'body,main,section,article,div,header,footer,aside,li,td
 
 function insertBlock(markup) {
   if (!active?.doc || mode !== 'edit') return
-  const doc = active.doc
-  const selected = [...selection].reverse().find((node) => node.ownerDocument === doc && !locked(node))
-  const template = doc.createElement('template')
+  const template = active.doc.createElement('template')
   template.innerHTML = markup
-  const added = template.content.firstElementChild
+  insertElement(active, template.content.firstElementChild)
+}
+
+function insertElement(board, added) {
+  const doc = board.doc
+  const selected = [...selection].reverse().find((node) => node.ownerDocument === doc && !locked(node))
   const defaultContainer = doc.querySelector('main') || doc.body
   const container = selected?.closest(blockContainers) || defaultContainer
   if (locked(container)) return
@@ -2392,17 +2532,54 @@ function insertBlock(markup) {
       while (anchor.parentElement !== container) anchor = anchor.parentElement
       anchor.after(added)
     }
+    activate(board)
     selection.clear()
     selection.add(added)
     revealSelectionPanels()
     const bounds = canvas.getBoundingClientRect()
-    const frame = active.frame.getBoundingClientRect()
+    const frame = board.frame.getBoundingClientRect()
     const box = added.getBoundingClientRect()
     if (frame.top + box.bottom * view.scale < bounds.top ||
         frame.top + box.top * view.scale > bounds.bottom ||
         frame.left + box.right * view.scale < bounds.left ||
         frame.left + box.left * view.scale > bounds.right) focusSelection()
   })
+}
+
+const maxSaveBytes = 8 * 1024 * 1024 // Match the service JSON request limit.
+
+async function insertLocalImage(board, file) {
+  try {
+    if (file.size > maxSaveBytes * 3 / 4) throw new Error('图片太大，请选择更小的图片。')
+    const reader = new FileReader()
+    const source = await new Promise((resolve, reject) => {
+      reader.onload = () => resolve(reader.result)
+      reader.onerror = () => reject(new Error('无法读取这张图片。'))
+      reader.readAsDataURL(file)
+    })
+    if (!source.startsWith('data:image/')) throw new Error('请选择浏览器支持的图片文件。')
+    const image = new Image()
+    image.src = source
+    await image.decode().catch(() => { throw new Error('无法打开这张图片。') })
+    if (mode !== 'edit' || restoring || boards.get(board.file) !== board) return
+
+    const changes = allBoards().filter((item) => item === board || item.current !== item.disk)
+      .map((item) => ({ file: item.file, baseRevision: item.revision, html: item.current }))
+    const pendingBytes = new TextEncoder().encode(JSON.stringify({ changes })).byteLength
+    if (pendingBytes + source.length + 256 > maxSaveBytes) {
+      throw new Error('加入这张图片会超过 HTML 的保存大小限制，请选择更小的图片。')
+    }
+    const added = board.doc.createElement('img')
+    added.src = source
+    added.alt = ''
+    added.width = Math.min(image.naturalWidth, 240)
+    added.height = Math.max(1, Math.round(image.naturalHeight * added.width / image.naturalWidth))
+    added.style.maxWidth = '100%'
+    added.style.height = 'auto'
+    insertElement(board, added)
+  } catch (error) {
+    notify(error.message, true)
+  }
 }
 
 function bindControls() {
@@ -2447,19 +2624,41 @@ function bindControls() {
       previewBoard(board)
       if (mode === 'edit') drawBoardSelection(board)
     }
+    if (mode === 'preview' && active?.fullWidth) {
+      viewBeforeFullPreview = view
+      focusBoard()
+    } else if (mode === 'edit' && viewBeforeFullPreview) {
+      view = viewBeforeFullPreview
+      viewBeforeFullPreview = undefined
+      keepBoardInView()
+      transform()
+      rememberLayout()
+    }
   }
   for (const control of document.querySelectorAll('[data-width]')) control.onclick = () => {
     if (!active) return
-    active.width = Number(control.dataset.width)
-    boardGeometry(active)
-    active.heightTracker?.schedule()
+    const fullscreen = control.dataset.width === 'full'
+    const previewChanged = mode === 'preview' && fullscreen !== active.fullWidth
+    active.fullWidth = fullscreen
+    if (fullscreen) sizeFullscreenBoard(active)
+    else {
+      active.width = Number(control.dataset.width)
+      boardGeometry(active)
+      active.heightTracker?.schedule()
+    }
+    if (previewChanged) {
+      if (fullscreen) viewBeforeFullPreview ||= view
+      previewBoard(active)
+    }
     activate(active)
-    rememberLayout()
+    if (fullscreen) focusBoard()
+    else rememberLayout()
   }
   qs('#focus-board-button').onclick = () => focusBoard()
   qs('#fit-button').onclick = () => fit()
   qs('#fit-button').title = '适应全部画板（Shift+1）'
   qs('#save-button').onclick = save
+  qs('#versions-button').onclick = showVersions
   qs('#undo-button').onclick = () => historyStep(undoStack, redoStack, 'before')
   qs('#redo-button').onclick = () => historyStep(redoStack, undoStack, 'after')
   qs('#context-button').onclick = () => {
@@ -2489,8 +2688,24 @@ function bindControls() {
     applyStyle('font-family', generic ? family : [JSON.stringify(family), ...(fallbacks.length ? fallbacks : ['sans-serif'])].join(', '))
   }
   qs('#font-load-button').onclick = loadLocalFonts
-  const blocks = [['文本', '<p>双击编辑文字</p>'], ['区块', '<section><h2>新章节</h2><p>输入正文</p></section>'], ['图片', '<img alt="" width="240" height="160">']]
-  for (const [label, markup] of blocks) qs('#blocks-panel').append(button(label, () => insertBlock(markup)))
+  const blocks = qs('#blocks-panel')
+  blocks.append(button('文本', () => insertBlock('<p>双击编辑文字</p>')))
+  blocks.append(button('区块', () => insertBlock('<section><h2>新章节</h2><p>输入正文</p></section>')))
+  const imagePicker = element('input')
+  imagePicker.type = 'file'
+  imagePicker.accept = 'image/*'
+  imagePicker.hidden = true
+  let imageBoard
+  imagePicker.onchange = () => {
+    const file = imagePicker.files[0]
+    imagePicker.value = ''
+    if (imageBoard && file) void insertLocalImage(imageBoard, file)
+  }
+  blocks.append(imagePicker, button('图片', () => {
+    if (!active?.doc) return notify('请先打开一个 HTML 文件。', true)
+    imageBoard = active
+    imagePicker.click()
+  }))
   document.addEventListener('keydown', shortcuts)
   document.addEventListener('keyup', releaseSpace)
   window.addEventListener('blur', () => releaseSpace())
@@ -2502,6 +2717,9 @@ function bindControls() {
 bindControls()
 bindCanvas()
 new ResizeObserver(() => {
+  for (const board of boards.values()) {
+    if (board.fullWidth) sizeFullscreenBoard(board)
+  }
   keepBoardInView()
   transform()
 }).observe(canvas)

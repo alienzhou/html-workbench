@@ -77,7 +77,7 @@ class BundleTests(unittest.TestCase):
             ("script", "workbench"),
             ("style", "workbench"),
         ])
-        self.assertLess(bundle.stat().st_size, 132_000)
+        self.assertLess(bundle.stat().st_size, 145_000)
 
     def test_frontend_exposes_edit_and_preview_modes(self):
         bundle = PROJECT_ROOT / "skill" / "html-workbench" / "assets" / "workbench.html"
@@ -337,6 +337,44 @@ class HttpTests(unittest.TestCase):
             result = json.load(response)
         self.assertEqual(result["documents"][0]["html"], change["html"])
         self.assertEqual(target.read_text(encoding="utf-8"), change["html"])
+
+    def test_version_history_preserves_current_before_restore_and_rejects_stale_requests(self):
+        target = self.page.resolve()
+        route = "/api/versions?" + urllib.parse.urlencode({"file": str(target)})
+        _, initial = self.read_json(route)
+        old_revision = initial["current"]["revision"]
+        self.assertEqual(initial["versions"], [])
+
+        updated = SAMPLE_HTML.replace("Hello", "Updated")
+        change = {"file": str(target), "baseRevision": old_revision, "html": updated}
+        save = urllib.request.Request(self.base + "/api/batch", method="PUT",
+                                      data=json.dumps({"changes": [change]}).encode("utf-8"),
+                                      headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(save, timeout=2) as response:
+            new_revision = json.load(response)["documents"][0]["revision"]
+
+        _, history = self.read_json(route)
+        self.assertEqual(history["current"]["revision"], new_revision)
+        self.assertEqual([entry["revision"] for entry in history["versions"]], [old_revision])
+        _, historical = self.read_json(route + "&revision=" + old_revision)
+        self.assertEqual(historical["html"], SAMPLE_HTML)
+
+        def restore(base_revision):
+            return urllib.request.Request(self.base + route, method="POST",
+                                          data=json.dumps({"baseRevision": base_revision, "revision": old_revision}).encode("utf-8"),
+                                          headers={"Content-Type": "application/json"})
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(restore(old_revision), timeout=2)
+        self.assertEqual(caught.exception.code, 409)
+        self.assertEqual(target.read_text(encoding="utf-8"), updated)
+
+        with urllib.request.urlopen(restore(new_revision), timeout=2) as response:
+            self.assertEqual(json.load(response)["html"], SAMPLE_HTML)
+        self.assertEqual(target.read_text(encoding="utf-8"), SAMPLE_HTML)
+        _, restored = self.read_json(route)
+        self.assertEqual(restored["current"]["revision"], old_revision)
+        self.assertEqual([entry["revision"] for entry in restored["versions"]], [new_revision])
 
     def test_health_and_document_endpoints(self):
         status, health = self.read_json("/api/health")
