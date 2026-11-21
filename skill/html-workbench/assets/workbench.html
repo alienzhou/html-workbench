@@ -457,6 +457,8 @@ const selection = new Set()
 const undoStack = []
 const redoStack = []
 const closedBranches = new WeakSet()
+let layerRows = new WeakMap()
+let currentLayer
 const visibleLayer = (node) => !node.matches('script, style, link, template, noscript, meta')
 const children = (node) => [...node.children].filter(visibleLayer)
 const pathname = (file) => file.split(/[\\/]/).at(-1)
@@ -1131,6 +1133,7 @@ function setPanels(left, right) {
   for (const toggle of document.querySelectorAll('[data-panel]')) {
     toggle.setAttribute('aria-expanded', String(toggle.dataset.panel === 'styles' ? right : toggle.dataset.panel === left))
   }
+  if (left === 'layers') scrollToLayer(currentLayer)
 }
 
 function leftPanel() {
@@ -1148,14 +1151,33 @@ function select(node, extend = false) {
   else selection.add(node)
   activate(owner(node))
   revealSelectionPanels()
-  updateSelection()
+  updateSelection(true)
 }
 
-function updateSelection() {
+function scrollToLayer(node) {
+  const row = layerRows.get(node)
+  const panel = layers.parentElement
+  if (!row?.isConnected || panel.hidden || control.hidden) return
+  const bounds = panel.getBoundingClientRect()
+  const target = row.getBoundingClientRect()
+  if (target.top < bounds.top) panel.scrollTop += target.top - bounds.top
+  else if (target.bottom > bounds.bottom) panel.scrollTop += target.bottom - bounds.bottom
+}
+
+function updateSelection(reveal = false) {
+  const latest = [...selection].at(-1)
+  const follow = latest && (reveal || latest !== currentLayer)
+  currentLayer = latest
+  if (follow) {
+    for (let parent = latest.parentElement; parent && parent !== latest.ownerDocument.body; parent = parent.parentElement) {
+      closedBranches.delete(parent)
+    }
+  }
   for (const board of boards.values()) drawBoardSelection(board)
   renderLayers()
   renderInspector()
   renderTokens()
+  if (follow) scrollToLayer(latest)
 }
 
 const guideAxes = [
@@ -1440,6 +1462,46 @@ function bindLayerDrag(board) {
   return () => dragged
 }
 
+function textAtPoint(target, x, y) {
+  const doc = target.ownerDocument
+  const caret = doc.caretPositionFromPoint?.(x, y) ?? doc.caretRangeFromPoint?.(x, y)
+  const text = caret?.offsetNode ?? caret?.startContainer
+  if (text?.nodeType !== 3 || !text.data.trim() || !target.contains(text)) return
+  const range = doc.createRange()
+  range.selectNodeContents(text)
+  if ([...range.getClientRects()].some((rect) =>
+    rect.left <= x && x <= rect.right && rect.top <= y && y <= rect.bottom)) {
+    return { text, offset: caret.offset ?? caret.startOffset }
+  }
+}
+
+function startTextEdit(board, text, offset) {
+  const target = text.parentElement
+  if (!(target instanceof board.doc.defaultView.HTMLElement) || locked(target)) return
+  select(target)
+  const before = board.current
+  const mixed = target.childNodes.length > 1
+  const editor = mixed ? board.doc.createElement('span') : target
+  const editable = editor.getAttribute('contenteditable')
+  if (mixed) {
+    text.replaceWith(editor)
+    editor.append(text)
+  }
+  editingText = editor
+  editor.contentEditable = 'plaintext-only'
+  editor.focus({ preventScroll: true })
+  if (offset !== undefined) board.doc.getSelection().collapse(text, offset)
+  editor.addEventListener('blur', () => {
+    if (mixed) {
+      text.data = editor.childElementCount ? editor.innerText : editor.textContent
+      editor.replaceWith(text)
+    } else if (editable === null) editor.removeAttribute('contenteditable')
+    else editor.setAttribute('contenteditable', editable)
+    editingText = null
+    finishChange(new Map([[board, before]]))
+  }, { once: true })
+}
+
 function connectFrame(board) {
   const doc = board.doc
   const dragged = bindLayerDrag(board)
@@ -1462,25 +1524,18 @@ function connectFrame(board) {
       updateSelection()
       return
     }
-    select(deepTarget(target, event.metaKey || event.ctrlKey), event.shiftKey)
+    const hit = textAtPoint(target, event.clientX, event.clientY)
+    select(hit?.text.parentElement || deepTarget(target, event.metaKey || event.ctrlKey), event.shiftKey)
   }, true)
   doc.addEventListener('dblclick', (event) => {
     const target = event.target
-    if (dragged() || locked(target) || target.matches('body,html')) return
+    if (mode !== 'edit' || restoring || dragged() || editingText?.contains(target) || locked(target) || target.matches('body,html')) return
     event.preventDefault()
-    select(target)
-    if (children(target).length || !target.textContent.trim()) return
-    const before = board.current
-    const editable = target.getAttribute('contenteditable')
-    editingText = target
-    target.contentEditable = 'plaintext-only'
-    target.focus()
-    target.addEventListener('blur', () => {
-      if (editable === null) target.removeAttribute('contenteditable')
-      else target.setAttribute('contenteditable', editable)
-      editingText = null
-      finishChange(new Map([[board, before]]))
-    }, { once: true })
+    const hit = textAtPoint(target, event.clientX, event.clientY)
+    const directText = [...target.childNodes].filter((node) => node.nodeType === 3 && node.data.trim())
+    const text = hit?.text || (directText.length === 1 ? directText[0] : undefined)
+    if (text) startTextEdit(board, text, hit?.offset)
+    else select(target)
   })
   doc.addEventListener('scroll', () => drawBoardSelection(board), true)
   doc.addEventListener('wheel', (event) => {
@@ -1499,6 +1554,7 @@ function connectFrame(board) {
 
 function renderLayers() {
   const term = qs('#layer-search').value.trim().toLocaleLowerCase()
+  layerRows = new WeakMap()
   layers.replaceChildren()
   for (const board of boards.values()) {
     const root = element('section', 'layer-board')
@@ -1708,9 +1764,9 @@ function layerBranch(node, depth, term) {
   const row = element('div', 'layer-row')
   row.classList.toggle('selected', selection.has(node))
   row.classList.toggle('locked', locked(node))
-  row.style.paddingInlineStart = `${8 + depth * 14}px`
+  row.style.paddingInlineStart = `${8 + Math.min(depth, 5) * 14}px`
   branch.append(row)
-  let matches = !term || `${nameOf(node)} ${node.localName}`.toLocaleLowerCase().includes(term)
+  let matches = !term || selection.has(node) || `${nameOf(node)} ${node.localName}`.toLocaleLowerCase().includes(term)
   if (!closedBranches.has(node) || term) {
     for (const child of nested) {
       const sub = layerBranch(child, depth + 1, term)
@@ -1721,6 +1777,7 @@ function layerBranch(node, depth, term) {
     }
   }
   if (!matches) return null
+  layerRows.set(node, row)
   const disclosure = iconButton(closedBranches.has(node) ? 'chevron-right' : 'chevron-down', closedBranches.has(node) ? '展开' : '折叠', () => {
     if (closedBranches.has(node)) closedBranches.delete(node)
     else closedBranches.add(node)
@@ -1731,6 +1788,7 @@ function layerBranch(node, depth, term) {
     select(node, event.shiftKey || event.metaKey || event.ctrlKey)
     if (node.getBoundingClientRect().bottom > node.ownerDocument.documentElement.clientHeight) node.scrollIntoView({ block: 'nearest' })
   }, 'layer-label')
+  label.title = label.textContent
   label.addEventListener('dblclick', () => renameLayer(node))
   row.addEventListener('mouseenter', () => setHover(node))
   row.addEventListener('mouseleave', () => setHover(null))
